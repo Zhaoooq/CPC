@@ -3,13 +3,13 @@
 set -eu
 
 THEME_NAME="cpc-gxy"
-THEME_SOURCE="/home/pi/Desktop/CPC_1/deployment/plymouth/${THEME_NAME}"
+THEME_SOURCE="/home/pi/Desktop/CPC/deployment/plymouth/${THEME_NAME}"
 THEME_TARGET="/usr/share/plymouth/themes/${THEME_NAME}"
-AUTOSTART_SOURCE="/home/pi/Desktop/CPC_1/deployment/autostart/cpc-1.desktop"
+AUTOSTART_SOURCE="/home/pi/Desktop/CPC/deployment/autostart/cpc-1.desktop"
 AUTOSTART_TARGET="/home/pi/.config/autostart/cpc-1.desktop"
-LX_SESSION_SOURCE="/home/pi/Desktop/CPC_1/deployment/session/LXDE-pi-autostart"
+LX_SESSION_SOURCE="/home/pi/Desktop/CPC/deployment/session/LXDE-pi-autostart"
 LX_SESSION_TARGET="/home/pi/.config/lxsession/LXDE-pi/autostart"
-LABWC_SESSION_SOURCE="/home/pi/Desktop/CPC_1/deployment/session/labwc-autostart"
+LABWC_SESSION_SOURCE="/home/pi/Desktop/CPC/deployment/session/labwc-autostart"
 LABWC_SESSION_TARGET="/home/pi/.config/labwc/autostart"
 WF_PANEL_CONFIG="/home/pi/.config/wf-panel-pi.ini"
 LX_PANEL_CONFIG="/home/pi/.config/lxpanel/LXDE-pi/panels/panel"
@@ -34,7 +34,7 @@ install -d -o pi -g pi -m 0755 /home/pi/.config/lxsession/LXDE-pi
 install -o pi -g pi -m 0644 "$LX_SESSION_SOURCE" "$LX_SESSION_TARGET"
 install -d -o pi -g pi -m 0755 /home/pi/.config/labwc
 install -o pi -g pi -m 0755 "$LABWC_SESSION_SOURCE" "$LABWC_SESSION_TARGET"
-chmod 0755 /home/pi/Desktop/CPC_1/start-cpc-1.sh
+chmod 0755 /home/pi/Desktop/CPC/start-cpc-1.sh
 
 # This image has both RealVNC and wayvnc enabled.  wayvnc cannot bind while
 # RealVNC owns the desktop session, then its wrapper takes roughly 15 seconds
