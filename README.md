@@ -9,6 +9,7 @@
 - 通过 FTDI D2XX + ADS8688 采集 OPC 模拟脉冲信号。
 - 对 OPC 信号进行动态阈值、脉冲分段、相邻峰拆分和重叠修正，计算颗粒计数速率并进行二次标定。
 - 每累计满约 1 秒更新一次主界面颗粒数目浓度趋势，同时显示 OPC 原始波形，并可将原始数据保存为 CSV。
+- 内置只读 Web 看板，可通过网线在 Windows 浏览器中实时查看颗粒浓度和最近 10 分钟趋势。
 - 使用三只 PT100/MAX31865 监测冷凝段、饱和段和 OPC 段温度。
 - 使用硬件 PWM 控制冷凝段制冷片和饱和段加热棒，并提供预测式温控逻辑。
 - 使用 ADS1115 轮询三路压差传感器，支持启动校零、滤波、量程检查和接反提示。
@@ -241,6 +242,8 @@ CPC/
 │   ├── PT100Sensor.*                 # SPI PT100/MAX31865 温度采集
 │   ├── PwmOutputs.*                  # RP1 sysfs PWM 和 lgpio 输出封装
 │   └── PinMap.h                      # 整机 GPIO/PWM 引脚表
+├── network/
+│   └── RemoteDashboard.*             # 端口 8080 的只读 HTTP/JSON 远程看板
 ├── state/
 │   └── AppRuntimeState.h             # 执行器和采集运行状态
 ├── ui/
@@ -249,6 +252,8 @@ CPC/
 │   ├── PlotSetup.*                   # OPC 与浓度曲线配置
 │   ├── Formatters.*                  # 显示格式化
 │   └── WatermarkWidget.*             # 页面水印
+├── web/
+│   └── dashboard.html                # Windows 浏览器端实时看板
 ├── deployment/                       # 树莓派开机画面、自动启动和桌面配置
 ├── qcustomplot.*                     # QCustomPlot 绘图库
 └── start-cpc-1.sh                    # 桌面自动启动入口
@@ -259,10 +264,11 @@ CPC/
 当前工程使用：
 
 - Raspberry Pi OS 64-bit / Raspberry Pi 5。
-- Qt 5 Widgets 与 PrintSupport。
+- Qt 5 Widgets、PrintSupport 与 Network。
 - qmake 和支持 C++11 的 g++。
 - `liblgpio`。
-- FTDI D2XX 头文件与动态库（`ftd2xx.h`、`libftd2xx`）。
+- `liblgpio-dev` 开发头文件。
+- FTDI D2XX 头文件（`ftd2xx.h`、`WinTypes.h`）与工程目录中的 ARMv8 动态库（`libftd2xx`）。
 - Linux I²C、SPI、串口和 sysfs PWM 接口。
 
 构建命令：
@@ -296,6 +302,28 @@ cd /home/pi/Desktop/CPC
 - FTDI D2XX 设备
 
 同时应确认 `/dev/ttyAMA0` 未被串口控制台或其他进程占用，并可通过 `i2cdetect -y 1` 在 `0x48` 检测到 ADS1115。
+
+## Windows 有线远程看板
+
+CPC 启动时会在全部 IPv4 网卡的 `8080` 端口启动只读 Web 服务。浏览器页面和
+JSON 接口均由主程序直接提供，不依赖互联网、Python 或第三方前端服务：
+
+- 看板：`http://<树莓派地址>:8080/`
+- 实时快照：`http://<树莓派地址>:8080/api/snapshot`
+- 历史 CSV 下载：`http://<树莓派地址>:8080/api/history.csv`，可带 `from_sequence` / `to_sequence` 参数导出指定数据段。
+- 存活检查：`http://<树莓派地址>:8080/health`
+
+树莓派与 Windows 用一根普通网线直连时，建议分别设置：
+
+```text
+Windows 有线网卡：192.168.50.1 / 255.255.255.0
+树莓派 eth0：     192.168.50.2 / 255.255.255.0
+网关和 DNS：      均留空
+```
+
+配置完成后，Windows 浏览器访问 `http://192.168.50.2:8080/`。页面右上角“保存数据”会开始记录这一段看板数据，再次点击“停止保存”后将本段 CSV 下载到 Windows 本地目录。详细操作和排障见
+[`docs/WINDOWS_DIRECT_ETHERNET.md`](docs/WINDOWS_DIRECT_ETHERNET.md)。该服务没有远程控制接口，
+不能从 Windows 启停气泵、阀门、温控或采集。
 
 ## 建议的首次实机检查顺序
 

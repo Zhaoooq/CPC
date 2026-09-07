@@ -45,6 +45,7 @@
 #include "hardware/PT100Sensor.h"
 #include "hardware/PinMap.h"
 #include "hardware/PwmOutputs.h"
+#include "network/RemoteDashboard.h"
 #include "qcustomplot.h"
 #include "state/AppRuntimeState.h"
 #include "ui/Formatters.h"
@@ -213,6 +214,13 @@ int main(int argc, char *argv[]) {
     QMainWindow window;
     window.setWindowFlag(Qt::FramelessWindowHint);
     MainWindowUi ui = buildMainWindow(app, window, opcParams, particleCalibration);
+    RemoteDashboard remoteDashboard(&window);
+    QString remoteDashboardError;
+    if (remoteDashboard.start(8080, &remoteDashboardError)) {
+        qInfo() << "CPC 有线远程看板已启动，端口:" << remoteDashboard.serverPort();
+    } else {
+        qWarning() << "CPC 有线远程看板启动失败:" << remoteDashboardError;
+    }
     auto saveOpcAlgorithmSettings = [&]() {
         pidSettings.setValue("opc_algorithm/min_range", opcParams.minRange);
         pidSettings.setValue("opc_algorithm/threshold_offset", opcParams.thresholdOffset);
@@ -257,6 +265,7 @@ int main(int argc, char *argv[]) {
         shutdownTrigger = QStringLiteral("界面关机按钮");
         ui.btnShutdown->setEnabled(false);
         ui.lblStatus->setText("状态: 正在安全关闭设备...");
+        remoteDashboard.setAcquiring(false);
         daqWorker->stopDaq();
         app.quit();
     });
@@ -272,19 +281,46 @@ int main(int argc, char *argv[]) {
     double &smoothedParticleConcentration = acquisitionState.smoothedParticleConcentration;
     double &latestParticleConcentrationTime = acquisitionState.latestParticleConcentrationTime;
 
-    QVector<double> rawTimeBuffer;
-    QVector<double> rawVoltageBuffer;
     QVector<double> opcDisplayTimeBuffer;
     QVector<double> opcDisplayVoltageBuffer;
     QVector<double> opcPeakTimeBuffer;
     QVector<double> opcPeakVoltageBuffer;
     constexpr double PARTICLE_DISPLAY_SMOOTHING_ALPHA = 0.65;
     ParticleCountRateAccumulator particleCountRateAccumulator(1.0);
-    constexpr int MAX_RAW_BUFFER_SAMPLES = 2000000; // 约 10 秒 @ 200 kSPS，避免长时间运行撑爆内存。
-    constexpr int RAW_TRIM_MARGIN_SAMPLES = 200000; // 批量裁剪，避免每帧搬移百万级 QVector。
     constexpr double OPC_DISPLAY_WINDOW_SECONDS = 0.05;
     constexpr int OPC_DISPLAY_POINTS_PER_CHUNK = 1000;
     constexpr int OPC_PLOT_REFRESH_INTERVAL_MS = 33; // 约 30 FPS，兼顾树莓派上的平滑度与负载。
+    QFile rawRecordingFile;
+    bool rawRecordingActive = false;
+    qint64 rawRecordedSampleCount = 0;
+    QElapsedTimer rawRecordingFlushTimer;
+    auto stopRawRecording = [&](bool showCompletionMessage) {
+        if (!rawRecordingActive) return;
+
+        const QString fileName = rawRecordingFile.fileName();
+        const bool flushSucceeded = rawRecordingFile.flush();
+        const QString flushError = rawRecordingFile.errorString();
+        rawRecordingFile.close();
+        rawRecordingActive = false;
+        updateAcqUi();
+
+        if (!flushSucceeded) {
+            const QString message = QString("关闭 CSV 文件时写入失败，文件可能不完整。\n%1")
+                .arg(flushError);
+            if (showCompletionMessage) {
+                QMessageBox::warning(&window, "保存失败", message);
+            } else {
+                qWarning().noquote() << message;
+            }
+        } else if (showCompletionMessage) {
+            QMessageBox::information(
+                &window,
+                "保存完成",
+                QString("本段数据已保存。\n采样点：%1\n文件：%2")
+                    .arg(rawRecordedSampleCount)
+                    .arg(QDir::toNativeSeparators(fileName)));
+        }
+    };
     bool hasLatestAdaptiveThreshold = false;
     double latestAdaptiveBaseline = 0.0;
     double latestAdaptiveNoiseRange = 0.0;
@@ -336,7 +372,8 @@ int main(int argc, char *argv[]) {
         ui.btnAcqStart->setEnabled(
             !is_acquiring && !workerRunning);
         ui.btnAcqStop->setEnabled(is_acquiring);
-        ui.btnSaveRaw->setEnabled(!rawTimeBuffer.isEmpty());
+        ui.btnSaveRaw->setText(rawRecordingActive ? "停止保存" : "保存数据");
+        ui.btnSaveRaw->setEnabled(rawRecordingActive || is_acquiring);
         if (startupPhase == StartupPhase::SelfCheck) {
             if (startupBlockReason.isEmpty()) {
                 ui.lblCaptureState->setText("采集: 快速自检");
@@ -358,7 +395,9 @@ int main(int argc, char *argv[]) {
     };
 
     QObject::connect(daqWorker, &QThread::finished, &window, [&]() {
+        stopRawRecording(true);
         is_acquiring = false;
+        remoteDashboard.setAcquiring(false);
         stopPumpSafely();
         updateAcqUi();
     });
@@ -366,13 +405,45 @@ int main(int argc, char *argv[]) {
     QObject::connect(daqWorker, &DaqWorker::dataReady, ui.opcPlot, [&](QVector<double> time, QVector<double> voltage) {
         if (!is_acquiring || time.isEmpty()) return;
 
-        rawTimeBuffer += time;
-        rawVoltageBuffer += voltage;
-        if (!ui.btnSaveRaw->isEnabled()) ui.btnSaveRaw->setEnabled(true);
-        if (rawTimeBuffer.size() > MAX_RAW_BUFFER_SAMPLES + RAW_TRIM_MARGIN_SAMPLES) {
-            int excess = rawTimeBuffer.size() - MAX_RAW_BUFFER_SAMPLES;
-            rawTimeBuffer.remove(0, excess);
-            rawVoltageBuffer.remove(0, excess);
+        if (rawRecordingActive) {
+            const int sampleCount = qMin(time.size(), voltage.size());
+            QByteArray csvChunk;
+            csvChunk.reserve(sampleCount * 24);
+            for (int i = 0; i < sampleCount; ++i) {
+                csvChunk.append(QByteArray::number(time.at(i), 'f', 6));
+                csvChunk.append(',');
+                csvChunk.append(QByteArray::number(voltage.at(i), 'f', 5));
+                csvChunk.append('\n');
+            }
+
+            const qint64 bytesWritten = rawRecordingFile.write(csvChunk);
+            if (bytesWritten != csvChunk.size()) {
+                const QString error = rawRecordingFile.errorString();
+                rawRecordingFile.flush();
+                rawRecordingFile.close();
+                rawRecordingActive = false;
+                updateAcqUi();
+                QMessageBox::warning(
+                    &window,
+                    "数据保存中断",
+                    QString("写入 CSV 文件失败，已停止保存。\n%1").arg(error));
+            } else {
+                rawRecordedSampleCount += sampleCount;
+                if (rawRecordingFlushTimer.elapsed() >= 1000) {
+                    if (!rawRecordingFile.flush()) {
+                        const QString error = rawRecordingFile.errorString();
+                        rawRecordingFile.close();
+                        rawRecordingActive = false;
+                        updateAcqUi();
+                        QMessageBox::warning(
+                            &window,
+                            "数据保存中断",
+                            QString("刷新 CSV 文件失败，已停止保存。\n%1").arg(error));
+                    } else {
+                        rawRecordingFlushTimer.restart();
+                    }
+                }
+            }
         }
 
         int displayStride = qMax(1, time.size() / OPC_DISPLAY_POINTS_PER_CHUNK);
@@ -437,11 +508,17 @@ int main(int argc, char *argv[]) {
             }
             latestParticleConcentrationTime = time.last();
             hasLatestParticleConcentration = true;
+            remoteDashboard.publishParticleConcentration(
+                latestParticleConcentrationTime,
+                latestParticleConcentration,
+                latestParticleConcentrationValid);
         }
     }, Qt::QueuedConnection);
 
     QObject::connect(daqWorker, &DaqWorker::errorOccurred, &window, [&](const QString& msg) {
+        stopRawRecording(false);
         is_acquiring = false;
+        remoteDashboard.setAcquiring(false);
         stopPumpSafely();
         updateAcqUi();
         QMessageBox::critical(&window, "数据采集错误", msg);
@@ -477,8 +554,6 @@ int main(int argc, char *argv[]) {
             updateAcqUi();
             return;
         }
-        rawTimeBuffer.clear();
-        rawVoltageBuffer.clear();
         opcDisplayTimeBuffer.clear();
         opcDisplayVoltageBuffer.clear();
         opcPeakTimeBuffer.clear();
@@ -502,6 +577,8 @@ int main(int argc, char *argv[]) {
         ui.lblOpcAlgorithmRealtime->setText(
             "实时算法结果：等待 OPC 采集数据（cutoff 为实际判定阈值，offset 为人工修正量）");
         is_acquiring = true;
+        remoteDashboard.resetMeasurements();
+        remoteDashboard.setAcquiring(true);
         daqWorker->startDaq();
         updateAcqUi();
     });
@@ -509,8 +586,10 @@ int main(int argc, char *argv[]) {
     QObject::connect(ui.btnAcqStop, &QPushButton::clicked, [&]() {
         if (!is_acquiring && !daqWorker->isRunning()) return;
         is_acquiring = false;
+        remoteDashboard.setAcquiring(false);
         daqWorker->stopDaq();
         stopPumpSafely();
+        stopRawRecording(true);
         updateAcqUi();
     });
 
@@ -650,29 +729,45 @@ int main(int argc, char *argv[]) {
     });
 
     QObject::connect(ui.btnSaveRaw, &QPushButton::clicked, [&]() {
-        if (rawTimeBuffer.isEmpty()) {
-            QMessageBox::information(&window, "保存原始数据", "当前没有可保存的原始信号数据。");
+        if (rawRecordingActive) {
+            stopRawRecording(true);
             return;
         }
+        if (!is_acquiring) return;
 
-        QString defaultName = QString("opc_raw_%1.csv").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
-        QString fileName = QFileDialog::getSaveFileName(&window, "保存 OPC 原始信号", defaultName, "CSV 文件 (*.csv)");
+        const QString defaultName = QString("opc_raw_%1.csv").arg(
+            QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+        const QString fileName = QFileDialog::getSaveFileName(
+            &window,
+            "开始保存 OPC 原始信号",
+            defaultName,
+            "CSV 文件 (*.csv)");
         if (fileName.isEmpty()) return;
 
-        QFile file(fileName);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::warning(&window, "保存失败", "无法打开文件进行写入。");
+        rawRecordingFile.setFileName(fileName);
+        if (!rawRecordingFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            QMessageBox::warning(
+                &window,
+                "保存失败",
+                QString("无法打开文件进行写入。\n%1").arg(rawRecordingFile.errorString()));
             return;
         }
 
-        QTextStream out(&file);
-        out << "Time(s),Voltage(V)\n";
-        for (int i = 0; i < rawTimeBuffer.size() && i < rawVoltageBuffer.size(); ++i) {
-            out << QString::number(rawTimeBuffer[i], 'f', 6) << ","
-                << QString::number(rawVoltageBuffer[i], 'f', 5) << "\n";
+        const QByteArray csvHeader("Time(s),Voltage(V)\n");
+        if (rawRecordingFile.write(csvHeader) != csvHeader.size()) {
+            const QString error = rawRecordingFile.errorString();
+            rawRecordingFile.close();
+            QMessageBox::warning(
+                &window,
+                "保存失败",
+                QString("无法写入 CSV 文件。\n%1").arg(error));
+            return;
         }
-        file.close();
-        QMessageBox::information(&window, "保存完成", QString("已保存 %1 个采样点。").arg(rawTimeBuffer.size()));
+
+        rawRecordedSampleCount = 0;
+        rawRecordingActive = true;
+        rawRecordingFlushTimer.restart();
+        updateAcqUi();
     });
 
     updateAcqUi();
@@ -1634,6 +1729,7 @@ int main(int argc, char *argv[]) {
     };
 
     QObject::connect(&app, &QCoreApplication::aboutToQuit, [&]() {
+        stopRawRecording(false);
         performSafetyShutdown(shutdownTrigger);
     });
 

@@ -1,4 +1,4 @@
-QT += widgets printsupport
+QT += widgets printsupport network
 
 CONFIG += c++11
 CONFIG -= app_bundle
@@ -21,6 +21,7 @@ SOURCES += \
     hardware/N4IOA01Valve.cpp \
     hardware/PT100Sensor.cpp \
     hardware/PwmOutputs.cpp \
+    network/RemoteDashboard.cpp \
     ui/ControlWidgets.cpp \
     ui/Formatters.cpp \
     ui/MainWindowUi.cpp \
@@ -40,6 +41,7 @@ HEADERS += \
     hardware/PT100Sensor.h \
     hardware/PinMap.h \
     hardware/PwmOutputs.h \
+    network/RemoteDashboard.h \
     state/AppRuntimeState.h \
     ui/ControlWidgets.h \
     ui/Formatters.h \
@@ -52,4 +54,6 @@ HEADERS += \
 
 RESOURCES += resources.qrc
 
-LIBS += -llgpio -lftd2xx
+# The vendor D2XX shared object is deployed beside the CPC executable.
+LIBS += -L$$PWD -llgpio -lftd2xx
+QMAKE_RPATHDIR += $$PWD
