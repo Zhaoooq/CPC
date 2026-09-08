@@ -1,6 +1,6 @@
 # CPC 凝结核粒子计数器主控平台
 
-`CPC` 是运行在 Raspberry Pi 5 上的凝结核粒子计数器（Condensation Particle Counter）整机控制程序。项目使用 Qt 5/C++ 构建图形界面，将 OPC 原始信号采集与计数速率标定、三段温度监测与控制、气泵和比例阀控制、三路压差测量、液位自动补液、手动排液及整机安全关机集中在一个全屏操作平台中。
+`CPC` 是运行在 Raspberry Pi 5 上的凝结核粒子计数器（Condensation Particle Counter）整机控制程序。项目使用 Qt 5/C++ 构建图形界面，将 OPC 原始信号采集与计数速率标定、三段温度监测与控制、气泵和比例阀控制、三路压差测量、液位自动补液、手动排液、有线网络与工控机通讯及整机安全关机集中在一个全屏操作平台中。
 
 > 本仓库面向实际硬件。编译成功只能证明软件可以构建，不能替代接线、电平、流量、温度和阀门动作的实机验证。首次运行前请先确认执行器默认状态安全。
 
@@ -9,7 +9,9 @@
 - 通过 FTDI D2XX + ADS8688 采集 OPC 模拟脉冲信号。
 - 对 OPC 信号进行动态阈值、脉冲分段、相邻峰拆分和重叠修正，计算颗粒计数速率并进行二次标定。
 - 每累计满约 1 秒更新一次主界面颗粒数目浓度趋势，同时显示 OPC 原始波形，并可将原始数据保存为 CSV。
+- 提供独立通讯页面，可查看有线网卡状态、配置 DHCP/静态 IPv4，并管理 Web 与 TCP 服务。
 - 内置只读 Web 看板，可通过网线在 Windows 浏览器中实时查看颗粒浓度和最近 10 分钟趋势。
+- 内置 CPC TCP Protocol V1.0 服务，每秒向 Windows 工控机发送颗粒浓度和状态帧。
 - 使用三只 PT100/MAX31865 监测冷凝段、饱和段和 OPC 段温度。
 - 使用硬件 PWM 控制冷凝段制冷片和饱和段加热棒，并提供预测式温控逻辑。
 - 使用 ADS1115 轮询三路压差传感器，支持启动校零、滤波、量程检查和接反提示。
@@ -54,6 +56,19 @@ flowchart TB
     end
     Ready --> Acq
 
+    subgraph Communication[有线网络与工控机通讯]
+        direction LR
+        CommUI[通讯页面<br/>状态查看与显式应用] --> NetConfig[NetworkConfigManager<br/>DHCP / 静态 IPv4]
+        NetConfig --> NM[NetworkManager<br/>CPC-ETH0 配置 / 验证 / 回滚]
+        CommUI --> Web[RemoteDashboard<br/>HTTP / JSON :8080]
+        CommUI --> Tcp[CpcTcpServer<br/>CPC ASCII :5000]
+        Web --> Browser[Windows 浏览器]
+        Tcp --> IPC[Windows 工控机]
+    end
+    Launch -->|读取通讯配置| CommUI
+    Count --> Web
+    Count --> Tcp
+
     subgraph Pressure[比例阀与压差闭环]
         direction LR
         ValveDefault[启动自动设置<br/>80% / 16.80 mA] --> N4[N4IOA01 4–20 mA]
@@ -80,7 +95,7 @@ flowchart TB
 
 ## 界面页面
 
-程序使用 1280×720 全屏无边框界面，共包含六个页面：
+程序使用 1280×720 全屏无边框界面，共包含七个页面：
 
 | 页面 | 主要内容 |
 | --- | --- |
@@ -90,6 +105,7 @@ flowchart TB
 | 液位 | 液位状态、自动补液运行记录和“按住排液”控制 |
 | 算法 | OPC 动态阈值设置，以及基于原始计数速率（个/s）的 `a·x²+b·x+c` 二次标定参数 |
 | OPC | 空气入口 → 饱和段 → 冷凝段 → OPC 光腔流程提示和最近 50 ms 原始波形 |
+| 通讯 | 有线网卡状态、DHCP/静态 IPv4 设置、Web/TCP 服务开关与端口，以及客户端和发送状态 |
 
 所有数值参数采用触控输入：点击数值框会打开大尺寸数字键盘，可直接输入并确认；界面不再依赖微小的上下调节箭头，滚轮也不会误改参数。
 
