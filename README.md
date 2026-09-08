@@ -243,11 +243,13 @@ CPC/
 │   ├── PwmOutputs.*                  # RP1 sysfs PWM 和 lgpio 输出封装
 │   └── PinMap.h                      # 整机 GPIO/PWM 引脚表
 ├── network/
-│   └── RemoteDashboard.*             # 端口 8080 的只读 HTTP/JSON 远程看板
+│   ├── RemoteDashboard.*             # 端口 8080 的只读 HTTP/JSON 远程看板
+│   ├── CpcTcpServer.*                # 端口 5000 的工控机 CPC ASCII 数据接口
+│   └── NetworkConfigManager.*        # 异步读取、应用并回滚 NetworkManager 配置
 ├── state/
 │   └── AppRuntimeState.h             # 执行器和采集运行状态
 ├── ui/
-│   ├── MainWindowUi.*                # 六个页面及全局界面结构
+│   ├── MainWindowUi.*                # 七个一级页面及全局界面结构
 │   ├── ControlWidgets.*              # 通用温控/总览控件
 │   ├── PlotSetup.*                   # OPC 与浓度曲线配置
 │   ├── Formatters.*                  # 显示格式化
@@ -303,10 +305,65 @@ cd /home/pi/Desktop/CPC
 
 同时应确认 `/dev/ttyAMA0` 未被串口控制台或其他进程占用，并可通过 `i2cdetect -y 1` 在 `0x48` 检测到 ADS1115。
 
-## Windows 有线远程看板
+## 通讯与网络配置
 
-CPC 启动时会在全部 IPv4 网卡的 `8080` 端口启动只读 Web 服务。浏览器页面和
-JSON 接口均由主程序直接提供，不依赖互联网、Python 或第三方前端服务：
+主界面顶部页面选择器中的“通讯”是与“温控”“气路”“液位”“算法”和“OPC”同级的独立页面。操作人员可以在本机触摸屏中：
+
+- 查看优先选取的 `eth0` 接口、当前 IPv4、链路状态及 NetworkManager profile，并手动刷新。
+- 在 DHCP 和静态 IPv4 间切换；静态模式可用四段式触控数字键盘设置地址、`1～32` 前缀、可选网关和可选 DNS。
+- 恢复推荐的 `192.168.50.2/24` 编辑值，或通过独立的“应用网络设置”写入系统。
+- 独立启用或关闭 Web 远程看板，修改 HTTP 监听端口。
+- 独立启用或关闭工控机 TCP 服务，修改 CPC TCP Protocol V1.0 监听端口。
+- 查看两个服务的实际监听状态、当前服务地址、工控机客户端地址、TCP 最近发送序号和时间。
+- 通过另一个“应用通讯设置”按钮显式重配并保存 Web/TCP 服务。
+
+程序启动时只读取有线网卡实时状态和 NetworkManager 真实配置，不会自动修改网络。应用网络设置时，`NetworkConfigManager` 优先管理绑定到有线接口的专用 `CPC-ETH0` profile；不存在时才在用户确认后创建。它不会修改 Wi-Fi、蓝牙或 VPN。每次写入前都会保存原活动 profile 以及已有 `CPC-ETH0` 的 IPv4 字段，然后异步执行 `nmcli` 参数列表（不调用 shell、不拼接命令），激活连接并验证：静态模式要求网卡实际地址与输入一致，DHCP 模式要求 profile 已保存为 `auto`。任何一步失败都会恢复旧字段、删除本次新建的 profile（如有）并重新激活原连接；回滚失败会在页面和 critical 日志中明确报告，但不会停止 DAQ、温控或其他硬件控制。
+
+静态地址应用前会检查严格 IPv4 格式、前缀、网络地址、广播地址、回环/保留地址、网关同子网以及 DNS 格式。修改地址会先提示现有浏览器和 TCP 客户端连接将断开。Web 和 TCP 均持续监听 `0.0.0.0`，网络恢复后不需要改变服务绑定，只需用新地址重新连接。
+
+默认通讯服务为 Web 启用且使用端口 `8080`，工控机 TCP 启用且使用端口 `5000`。修改开关或端口后只会显示“配置尚未应用”，直到点击“应用通讯设置”才会重配服务。Web 和 TCP 不允许使用同一端口；新端口启动失败时，程序会尝试恢复上一份已应用配置并在页面内显示结果。
+
+只有通讯服务配置使用 `QSettings` 保存：
+
+```text
+communication/web/enabled
+communication/web/port
+communication/tcp/enabled
+communication/tcp/port
+```
+
+有线 IPv4 不保存到 `QSettings`，NetworkManager 始终是真实配置源。程序启动时按上次保存的开关和端口分别恢复两个服务。任一网络服务或网络配置失败都只会在界面显示错误并写入日志，不会加入 CPC Ready 条件，也不会阻止采集、温控或其他控制功能。
+
+树莓派与 Windows 直连时推荐：
+
+```text
+CPC eth0：192.168.50.2 / 255.255.255.0
+Windows：  192.168.50.1 / 255.255.255.0
+网关：     留空
+DNS：      留空
+```
+
+### NetworkManager 权限部署
+
+CPC GUI 必须继续以普通用户运行，不能使用 `sudo ./CPC_1`。首次部署时由管理员一次性安装受限 PolicyKit 规则：
+
+```bash
+cd /home/pi/Desktop/CPC
+sudo deployment/install-network-permissions.sh pi
+sudo reboot
+```
+
+该脚本可重复执行，会创建 `cpc-network` 系统组、将指定桌面用户加入该组，并安装只覆盖 NetworkManager profile 修改和激活操作的规则；不会配置 `NOPASSWD ALL`。规则文件已存在时首次替换会保存 `.cpc-backup`。详见 `deployment/README.md`。
+
+## Windows 有线网络通信
+
+CPC 默认在全部 IPv4 网卡同时启动两个互不依赖的 TCP 服务（实际开关和端口以通讯页面保存的配置为准）：
+
+- `8080`：只读 HTTP Web 看板。
+- `5000`：Windows 工控机 CPC 颗粒结果 ASCII 数据接口。
+
+两者都由主程序直接提供，不依赖互联网、Python 或第三方前端服务。8080 的浏览器页面和
+JSON 接口包括：
 
 - 看板：`http://<树莓派地址>:8080/`
 - 实时快照：`http://<树莓派地址>:8080/api/snapshot`
@@ -324,6 +381,47 @@ Windows 有线网卡：192.168.50.1 / 255.255.255.0
 配置完成后，Windows 浏览器访问 `http://192.168.50.2:8080/`。页面右上角“保存数据”会开始记录这一段看板数据，再次点击“停止保存”后将本段 CSV 下载到 Windows 本地目录。详细操作和排障见
 [`docs/WINDOWS_DIRECT_ETHERNET.md`](docs/WINDOWS_DIRECT_ETHERNET.md)。该服务没有远程控制接口，
 不能从 Windows 启停气泵、阀门、温控或采集。
+
+Windows 工控机软件作为 TCP Client 连接：
+
+```text
+Host: 192.168.50.2
+Port: 5000
+```
+
+CPC TCP Protocol V1.0 使用 ASCII 文本和 CRLF 分帧，每产生一个新的约 1 秒颗粒统计结果发送一帧：
+
+```text
+$CPC,<Version>,<Sequence>,<Concentration>,<Status>\r\n
+```
+
+示例：
+
+```text
+$CPC,1,125,104.628,0\r\n
+```
+
+字段含义：
+
+- `$CPC`：固定帧头。
+- `Version`：协议版本，当前固定为 `1`。
+- `Sequence`：`quint32` 发送序号，由 `CpcTcpServer` 独立维护，每生成一次新的颗粒结果递增。
+- `Concentration`：与主界面和 8080 看板共用的最终颗粒显示值，固定 3 位小数；无效数据输出 `0.000`。
+- `Status`：`0` 表示数据正常，`2` 表示颗粒结果无效。预留状态包括 `1` 未开始采集、`3` OPC 采集异常、`4` CPC 未就绪、`5` 系统异常。
+
+TCP 是字节流，不保证一次 `write()` 对应工控机一次 `recv()`。客户端可能分两次收到一帧，也可能一次收到多帧。因此工控机软件必须把 `recv()` 到的数据追加到接收缓存，查找 `\r\n`，提取完整帧后再解析。
+
+可用测试客户端验证 5000 端口：
+
+```bash
+python3 tools/test_tcp_client.py
+```
+
+如需临时指定地址或端口：
+
+```bash
+python3 tools/test_tcp_client.py --host 192.168.50.2 --port 5000
+```
 
 ## 建议的首次实机检查顺序
 

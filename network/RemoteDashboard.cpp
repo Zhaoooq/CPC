@@ -28,13 +28,45 @@ RemoteDashboard::RemoteDashboard(QObject *parent)
 }
 
 bool RemoteDashboard::start(quint16 port, QString *errorMessage) {
-    if (m_server->isListening()) return true;
-
-    if (!m_server->listen(QHostAddress::AnyIPv4, port)) {
-        if (errorMessage) *errorMessage = m_server->errorString();
+    if (m_server->isListening()) {
+        if (m_server->serverPort() == port) return true;
+        const QString message = QStringLiteral("远程看板已在端口 %1 监听")
+                                    .arg(m_server->serverPort());
+        if (errorMessage) *errorMessage = message;
+        emit errorOccurred(message);
         return false;
     }
+
+    if (!m_server->listen(QHostAddress::AnyIPv4, port)) {
+        const QString message = m_server->errorString();
+        if (errorMessage) *errorMessage = message;
+        emit errorOccurred(message);
+        return false;
+    }
+    emit listeningChanged(true);
     return true;
+}
+
+void RemoteDashboard::stop() {
+    const bool wasListening = m_server->isListening();
+
+    const QList<QTcpSocket *> sockets = m_requestBuffers.keys();
+    m_requestBuffers.clear();
+    for (QTcpSocket *socket : sockets) {
+        if (!socket) continue;
+        socket->disconnect(this);
+        socket->abort();
+        socket->deleteLater();
+    }
+
+    if (wasListening) m_server->close();
+    while (m_server->hasPendingConnections()) {
+        QTcpSocket *socket = m_server->nextPendingConnection();
+        if (!socket) continue;
+        socket->abort();
+        socket->deleteLater();
+    }
+    if (wasListening) emit listeningChanged(false);
 }
 
 void RemoteDashboard::setAcquiring(bool acquiring) {

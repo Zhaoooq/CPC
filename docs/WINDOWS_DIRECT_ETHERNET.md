@@ -24,30 +24,27 @@ Windows 显示“未识别的网络”或“无 Internet”属于正常现象，
 
 ## 2. 配置树莓派有线网卡
 
-以下命令适用于使用 NetworkManager 的 Raspberry Pi OS。先查看连接名称：
+首次部署 CPC 时，管理员安装受限的 NetworkManager PolicyKit 权限并重启：
 
 ```bash
-nmcli -t -f NAME,DEVICE connection show --active
+cd /home/pi/Desktop/CPC
+sudo deployment/install-network-permissions.sh pi
+sudo reboot
 ```
 
-找到设备为 `eth0` 的连接名称。例如连接名称为 `Wired connection 1`，执行：
+此后操作人员不需要打开桌面、终端或 SSH：
 
-```bash
-sudo nmcli connection modify "Wired connection 1" \
-  ipv4.method manual \
-  ipv4.addresses 192.168.50.2/24 \
-  ipv4.gateway "" \
-  ipv4.dns ""
-sudo nmcli connection up "Wired connection 1"
-```
+1. 启动 CPC，使用顶部页面选择器进入“通讯”。
+2. 在“本机有线网络”选择“静态 IP”。
+3. 设置 `192.168.50.2`、前缀 `/24`，网关和 DNS 保持未勾选（空）。
+4. 点击“应用网络设置”，阅读断线提示后确认。
+5. 等待页面显示应用成功，核对“当前实际 IP”为 `192.168.50.2`。
 
-连接名称必须以第一条命令的实际输出为准。配置后检查：
+程序会创建或复用绑定到有线接口的 `CPC-ETH0` 专用 NetworkManager profile；不会假定系统连接名是 `Wired connection 1`。若应用或验证失败，程序会自动尝试恢复原 profile 和活动连接。CPC 主程序仍以普通用户身份运行。
 
-```bash
-ip -4 address show dev eth0
-```
+需要 DHCP 时，在同一页面选择“DHCP 自动获取”再应用。如果现场没有 DHCP 服务器，页面显示“当前尚未获取 IPv4”是正常状态，不会影响 CPC 的测量与控制功能。
 
-应当能看到 `192.168.50.2/24`。
+修改 IP 会断开已有的 Web 和工控机 TCP 连接，随后必须使用页面显示的新实际地址重新连接。
 
 ## 3. 编译并启动 CPC
 
@@ -70,11 +67,14 @@ sudo apt-get install qtbase5-dev qt5-qmake
 
 ## 4. 从 Windows 访问
 
+以下端口为通讯页面的默认值。如果已在 CPC 本机修改并应用端口，请在以下命令、浏览器地址和工控机客户端中使用页面显示的实际端口。
+
 先打开 PowerShell 检查链路：
 
 ```powershell
 ping 192.168.50.2
 Test-NetConnection 192.168.50.2 -Port 8080
+Test-NetConnection 192.168.50.2 -Port 5000
 ```
 
 然后使用 Edge 或 Chrome 打开：
@@ -87,14 +87,29 @@ http://192.168.50.2:8080/
 点击页面右上角“保存数据”开始记录这一段看板数据，按钮变为“停止保存”后再次点击即可将本段 CSV 下载到 Windows 本地目录；如果浏览器没有弹出保存位置，请在 Edge/Chrome 的下载设置中开启“每次下载前询问保存位置”。
 树莓派主程序内部最多保留 3600 个看板数据点，不会自动保存到磁盘。
 
+工控机软件或测试脚本连接 `192.168.50.2:5000` 接收 CPC TCP Protocol V1.0：
+
+```text
+$CPC,<Version>,<Sequence>,<Concentration>,<Status>\r\n
+$CPC,1,125,104.628,0\r\n
+```
+
+5000 端口只发送当前颗粒结果，不提供 HTTP 页面，也不发送 OPC 原始波形或 4000 点数据块。TCP 是字节流，Windows 客户端必须维护接收缓存并按 `\r\n` 提取完整帧，不能假设一次 `recv()` 就是一帧。
+
+仓库提供 Python 3 测试客户端：
+
+```powershell
+python tools/test_tcp_client.py --host 192.168.50.2 --port 5000
+```
+
 ## 常见问题
 
-### 可以 ping 通，但端口 8080 不通
+### 可以 ping 通，但端口 8080 或 5000 不通
 
 - 确认新版本 `CPC_1` 已经编译并正在运行。
-- 在树莓派执行 `ss -ltn | grep ':8080'`，应看到监听地址 `0.0.0.0:8080`。
-- 检查树莓派防火墙是否阻止 TCP 8080。
-- 检查是否已有其他程序占用了 8080 端口。
+- 在树莓派执行 `ss -ltn | grep -E ':8080|:5000'`，应看到监听地址 `0.0.0.0:8080` 和 `0.0.0.0:5000`。
+- 检查树莓派防火墙是否阻止 TCP 8080 或 TCP 5000。
+- 检查是否已有其他程序占用了 8080 或 5000 端口。
 
 ### 页面打开，但没有曲线
 

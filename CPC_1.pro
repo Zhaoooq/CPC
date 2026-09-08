@@ -21,6 +21,8 @@ SOURCES += \
     hardware/N4IOA01Valve.cpp \
     hardware/PT100Sensor.cpp \
     hardware/PwmOutputs.cpp \
+    network/CpcTcpServer.cpp \
+    network/NetworkConfigManager.cpp \
     network/RemoteDashboard.cpp \
     ui/ControlWidgets.cpp \
     ui/Formatters.cpp \
@@ -41,6 +43,8 @@ HEADERS += \
     hardware/PT100Sensor.h \
     hardware/PinMap.h \
     hardware/PwmOutputs.h \
+    network/CpcTcpServer.h \
+    network/NetworkConfigManager.h \
     network/RemoteDashboard.h \
     state/AppRuntimeState.h \
     ui/ControlWidgets.h \

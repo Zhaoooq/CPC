@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDebug>
@@ -15,6 +16,7 @@
 #include <QPushButton>
 #include <QProcess>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QStandardPaths>
 #include <QStringList>
@@ -45,6 +47,8 @@
 #include "hardware/PT100Sensor.h"
 #include "hardware/PinMap.h"
 #include "hardware/PwmOutputs.h"
+#include "network/CpcTcpServer.h"
+#include "network/NetworkConfigManager.h"
 #include "network/RemoteDashboard.h"
 #include "qcustomplot.h"
 #include "state/AppRuntimeState.h"
@@ -70,6 +74,34 @@ constexpr PidTunings COND_PID_RECOMMENDED = {20.0, 1.5, 40.0};
 constexpr PidTunings SAT_PID_RECOMMENDED = {6.0, 0.05, 120.0};
 constexpr PidTunings OPC_PID_RECOMMENDED = {8.0, 0.10, 60.0};
 constexpr double OPC_OVERTEMP_MARGIN_C = 5.0;
+constexpr quint16 DEFAULT_WEB_PORT = 8080;
+constexpr quint16 DEFAULT_TCP_PORT = 5000;
+constexpr quint16 MIN_SERVICE_PORT = 1024;
+
+struct CommunicationConfig {
+    bool webEnabled = true;
+    quint16 webPort = DEFAULT_WEB_PORT;
+    bool tcpEnabled = true;
+    quint16 tcpPort = DEFAULT_TCP_PORT;
+};
+
+QString ipv4FromEditors(QDoubleSpinBox *const editors[4]) {
+    return QStringLiteral("%1.%2.%3.%4")
+        .arg(static_cast<int>(editors[0]->value()))
+        .arg(static_cast<int>(editors[1]->value()))
+        .arg(static_cast<int>(editors[2]->value()))
+        .arg(static_cast<int>(editors[3]->value()));
+}
+
+void setIpv4Editors(QDoubleSpinBox *const editors[4], const QString &address) {
+    const QStringList parts = address.split('.');
+    for (int i = 0; i < 4; ++i) {
+        const QSignalBlocker blocker(editors[i]);
+        bool ok = false;
+        const int value = i < parts.size() ? parts.at(i).toInt(&ok) : 0;
+        editors[i]->setValue(ok && value >= 0 && value <= 255 ? value : 0);
+    }
+}
 
 volatile std::sig_atomic_t pendingTerminationSignal = 0;
 
@@ -211,16 +243,611 @@ int main(int argc, char *argv[]) {
     bool &is_bypass_valve_open = actuatorState.bypassValveOpen;
     double &pump_current_power = actuatorState.pumpCurrentPower;
 
+    auto loadCommunicationPort = [&](const QString& key, quint16 defaultPort) {
+        bool ok = false;
+        const uint value = pidSettings.value(key, defaultPort).toUInt(&ok);
+        if (!ok || value < MIN_SERVICE_PORT || value > 65535U) {
+            qWarning().noquote()
+                << QStringLiteral("通讯端口配置无效，已使用默认值：%1=%2")
+                       .arg(key).arg(defaultPort);
+            return defaultPort;
+        }
+        return static_cast<quint16>(value);
+    };
+    CommunicationConfig communicationConfig;
+    communicationConfig.webEnabled =
+        pidSettings.value(QStringLiteral("communication/web/enabled"), true).toBool();
+    communicationConfig.webPort = loadCommunicationPort(
+        QStringLiteral("communication/web/port"), DEFAULT_WEB_PORT);
+    communicationConfig.tcpEnabled =
+        pidSettings.value(QStringLiteral("communication/tcp/enabled"), true).toBool();
+    communicationConfig.tcpPort = loadCommunicationPort(
+        QStringLiteral("communication/tcp/port"), DEFAULT_TCP_PORT);
+    if (communicationConfig.webPort == communicationConfig.tcpPort) {
+        qWarning() << "已保存的 Web 与 TCP 端口冲突，已恢复默认端口";
+        communicationConfig.webPort = DEFAULT_WEB_PORT;
+        communicationConfig.tcpPort = DEFAULT_TCP_PORT;
+    }
+
     QMainWindow window;
     window.setWindowFlag(Qt::FramelessWindowHint);
     MainWindowUi ui = buildMainWindow(app, window, opcParams, particleCalibration);
+    ui.btnWebEnable->setChecked(communicationConfig.webEnabled);
+    ui.btnWebEnable->setText(communicationConfig.webEnabled ? QStringLiteral("开")
+                                                             : QStringLiteral("关"));
+    ui.sbWebPort->setValue(communicationConfig.webPort);
+    ui.btnTcpEnable->setChecked(communicationConfig.tcpEnabled);
+    ui.btnTcpEnable->setText(communicationConfig.tcpEnabled ? QStringLiteral("开")
+                                                             : QStringLiteral("关"));
+    ui.sbTcpPort->setValue(communicationConfig.tcpPort);
+
     RemoteDashboard remoteDashboard(&window);
-    QString remoteDashboardError;
-    if (remoteDashboard.start(8080, &remoteDashboardError)) {
+    QString webServiceError;
+    if (!communicationConfig.webEnabled) {
+        qInfo() << "CPC 有线远程看板按保存配置保持关闭";
+    } else if (remoteDashboard.start(communicationConfig.webPort, &webServiceError)) {
         qInfo() << "CPC 有线远程看板已启动，端口:" << remoteDashboard.serverPort();
     } else {
-        qWarning() << "CPC 有线远程看板启动失败:" << remoteDashboardError;
+        qWarning() << "CPC 有线远程看板启动失败:" << webServiceError;
     }
+    CpcTcpServer cpcTcpServer(&window);
+    QString tcpServiceError;
+    if (!communicationConfig.tcpEnabled) {
+        qInfo() << "CPC TCP Server 按保存配置保持关闭";
+    } else if (cpcTcpServer.start(communicationConfig.tcpPort, &tcpServiceError)) {
+        qInfo().noquote()
+            << QStringLiteral("CPC TCP Server listening on 0.0.0.0:%1")
+                   .arg(cpcTcpServer.serverPort());
+    } else {
+        qWarning() << "CPC TCP Server error:" << tcpServiceError;
+    }
+
+    NetworkConfigManager networkConfigManager(&window);
+    NetworkConfigManager::NetworkStatus localNetworkStatus;
+    bool networkEditorsDirty = false;
+    bool settingNetworkEditors = false;
+    bool forceLoadNetworkEditors = true;
+    QString networkOperationResult;
+    bool networkOperationResultIsError = false;
+    quint32 lastTcpSequence = 0;
+    QDateTime lastTcpSentAt;
+    auto setCommunicationStatusLabel = [](QLabel *label,
+                                          const QString& text,
+                                          const QString& foreground,
+                                          const QString& background,
+                                          const QString& border) {
+        label->setText(text);
+        label->setStyleSheet(
+            QStringLiteral("font-size: 18px; color: %1; font-weight: bold; "
+                           "background: %2; border: 1px solid %3; "
+                           "border-radius: 12px; padding: 5px 10px;")
+                .arg(foreground, background, border));
+    };
+    auto communicationUiIsDirty = [&]() {
+        return ui.btnWebEnable->isChecked() != communicationConfig.webEnabled ||
+               static_cast<quint16>(ui.sbWebPort->value()) != communicationConfig.webPort ||
+               ui.btnTcpEnable->isChecked() != communicationConfig.tcpEnabled ||
+               static_cast<quint16>(ui.sbTcpPort->value()) != communicationConfig.tcpPort;
+    };
+    auto refreshCommunicationUi = [&]() {
+        ui.btnWebEnable->setText(ui.btnWebEnable->isChecked()
+                                    ? QStringLiteral("开") : QStringLiteral("关"));
+        ui.btnTcpEnable->setText(ui.btnTcpEnable->isChecked()
+                                    ? QStringLiteral("开") : QStringLiteral("关"));
+
+        if (remoteDashboard.isListening()) {
+            setCommunicationStatusLabel(ui.lblWebStatus, QStringLiteral("● 正常运行"),
+                                        QStringLiteral("#176B55"), QStringLiteral("#E8F8F3"),
+                                        QStringLiteral("#A9DFCF"));
+        } else if (!communicationConfig.webEnabled) {
+            setCommunicationStatusLabel(ui.lblWebStatus, QStringLiteral("● 已关闭"),
+                                        QStringLiteral("#65737E"), QStringLiteral("#EDF1F3"),
+                                        QStringLiteral("#D1D9DE"));
+        } else {
+            const QString details = webServiceError.isEmpty()
+                ? QStringLiteral("启动失败")
+                : QStringLiteral("启动失败：%1").arg(webServiceError);
+            setCommunicationStatusLabel(ui.lblWebStatus, QStringLiteral("● %1").arg(details),
+                                        QStringLiteral("#A93226"), QStringLiteral("#FDEDEC"),
+                                        QStringLiteral("#F5B7B1"));
+        }
+
+        if (cpcTcpServer.hasClient()) {
+            setCommunicationStatusLabel(ui.lblTcpStatus, QStringLiteral("● 工控机已连接"),
+                                        QStringLiteral("#176B55"), QStringLiteral("#E8F8F3"),
+                                        QStringLiteral("#A9DFCF"));
+        } else if (cpcTcpServer.isListening()) {
+            setCommunicationStatusLabel(ui.lblTcpStatus, QStringLiteral("● 正常监听 · 等待客户端"),
+                                        QStringLiteral("#9A6400"), QStringLiteral("#FFF6DF"),
+                                        QStringLiteral("#F3D58A"));
+        } else if (!communicationConfig.tcpEnabled) {
+            setCommunicationStatusLabel(ui.lblTcpStatus, QStringLiteral("● 已关闭"),
+                                        QStringLiteral("#65737E"), QStringLiteral("#EDF1F3"),
+                                        QStringLiteral("#D1D9DE"));
+        } else {
+            const QString details = tcpServiceError.isEmpty()
+                ? QStringLiteral("启动失败")
+                : QStringLiteral("启动失败：%1").arg(tcpServiceError);
+            setCommunicationStatusLabel(ui.lblTcpStatus, QStringLiteral("● %1").arg(details),
+                                        QStringLiteral("#A93226"), QStringLiteral("#FDEDEC"),
+                                        QStringLiteral("#F5B7B1"));
+        }
+
+        const quint16 displayedWebPort = remoteDashboard.isListening()
+            ? remoteDashboard.serverPort() : communicationConfig.webPort;
+        const quint16 displayedTcpPort = cpcTcpServer.isListening()
+            ? cpcTcpServer.serverPort() : communicationConfig.tcpPort;
+        if (localNetworkStatus.actualIpv4.isEmpty()) {
+            ui.lblWebAddress->setText("网络地址不可用");
+            ui.lblTcpAddress->setText("网络地址不可用");
+        } else {
+            ui.lblWebAddress->setText(
+                QStringLiteral("http://%1:%2/").arg(localNetworkStatus.actualIpv4).arg(displayedWebPort));
+            ui.lblTcpAddress->setText(
+                QStringLiteral("%1:%2").arg(localNetworkStatus.actualIpv4).arg(displayedTcpPort));
+        }
+        ui.lblTcpClient->setText(cpcTcpServer.hasClient()
+                                     ? cpcTcpServer.clientAddress()
+                                     : QStringLiteral("未连接"));
+        ui.lblTcpLastSequence->setText(lastTcpSequence == 0
+                                           ? QStringLiteral("暂无数据")
+                                           : QStringLiteral("序号 %1").arg(lastTcpSequence));
+        ui.lblTcpLastSendTime->setText(lastTcpSentAt.isValid()
+                                           ? lastTcpSentAt.toString(QStringLiteral("HH:mm:ss"))
+                                           : QStringLiteral("暂无数据"));
+
+        if (communicationUiIsDirty()) {
+            ui.lblCommunicationApplyStatus->setText("配置尚未应用，当前服务仍使用上次配置。");
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #9A6400; font-weight: bold; padding: 6px 10px; "
+                "background: #FFF6DF; border: 1px solid #F3D58A; border-radius: 7px;");
+        } else if (ui.lblCommunicationApplyStatus->text().startsWith(
+                       QStringLiteral("配置尚未应用"))) {
+            ui.lblCommunicationApplyStatus->setText("当前配置已应用");
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #526471; font-weight: bold; padding: 6px 10px;");
+        }
+    };
+    auto readNetworkEditors = [&]() {
+        NetworkConfigManager::Ipv4Config config;
+        config.mode = ui.cmbNetworkIpv4Mode->currentIndex() == 0
+            ? NetworkConfigManager::Ipv4Mode::Dhcp
+            : NetworkConfigManager::Ipv4Mode::Static;
+        config.address = ipv4FromEditors(ui.sbNetworkIp);
+        config.prefixLength = static_cast<int>(ui.sbNetworkPrefix->value());
+        config.gateway = ui.chkNetworkGateway->isChecked()
+            ? ipv4FromEditors(ui.sbNetworkGateway) : QString();
+        config.dns = ui.chkNetworkDns->isChecked()
+            ? ipv4FromEditors(ui.sbNetworkDns) : QString();
+        return config;
+    };
+    auto updateNetworkEditorState = [&]() {
+        const bool isStatic = ui.cmbNetworkIpv4Mode->currentIndex() == 1;
+        for (int i = 0; i < 4; ++i) {
+            ui.sbNetworkIp[i]->setEnabled(isStatic);
+            ui.sbNetworkGateway[i]->setEnabled(isStatic &&
+                                                ui.chkNetworkGateway->isChecked());
+            ui.sbNetworkDns[i]->setEnabled(isStatic && ui.chkNetworkDns->isChecked());
+        }
+        ui.sbNetworkPrefix->setEnabled(isStatic);
+        ui.chkNetworkGateway->setEnabled(isStatic);
+        ui.chkNetworkDns->setEnabled(isStatic);
+
+        const NetworkConfigManager::Ipv4Config edited = readNetworkEditors();
+        ui.lblNetworkNetmask->setText(isStatic
+            ? QStringLiteral("/%1 = %2")
+                  .arg(edited.prefixLength)
+                  .arg(NetworkConfigManager::netmaskForPrefix(edited.prefixLength))
+            : QStringLiteral("IP、前缀、网关和 DNS 自动获取"));
+        ui.lblRecommendedIpc->setText(isStatic
+            ? QStringLiteral("推荐工控机：%1")
+                  .arg(NetworkConfigManager::recommendedIpcAddress(edited))
+            : QStringLiteral("工控机需与 DHCP 分配地址处于同一网络"));
+    };
+    auto setNetworkEditors = [&](const NetworkConfigManager::Ipv4Config &config) {
+        settingNetworkEditors = true;
+        {
+            const QSignalBlocker modeBlocker(ui.cmbNetworkIpv4Mode);
+            const QSignalBlocker prefixBlocker(ui.sbNetworkPrefix);
+            const QSignalBlocker gatewayBlocker(ui.chkNetworkGateway);
+            const QSignalBlocker dnsBlocker(ui.chkNetworkDns);
+            ui.cmbNetworkIpv4Mode->setCurrentIndex(
+                config.mode == NetworkConfigManager::Ipv4Mode::Dhcp ? 0 : 1);
+            setIpv4Editors(ui.sbNetworkIp,
+                           config.address.isEmpty() ? QStringLiteral("192.168.50.2")
+                                                    : config.address);
+            ui.sbNetworkPrefix->setValue(config.prefixLength);
+            ui.chkNetworkGateway->setChecked(!config.gateway.isEmpty());
+            setIpv4Editors(ui.sbNetworkGateway, config.gateway);
+            ui.chkNetworkDns->setChecked(!config.dns.isEmpty());
+            setIpv4Editors(ui.sbNetworkDns, config.dns);
+        }
+        settingNetworkEditors = false;
+        networkEditorsDirty = false;
+        updateNetworkEditorState();
+    };
+    auto markNetworkEditorsDirty = [&]() {
+        if (settingNetworkEditors) return;
+        networkOperationResult.clear();
+        networkEditorsDirty = true;
+        updateNetworkEditorState();
+        ui.lblNetworkOperationStatus->setText(
+            QStringLiteral("网络配置尚未应用，系统仍使用当前实际配置。"));
+        ui.lblNetworkOperationStatus->setStyleSheet(
+            "font-size: 16px; color: #9A6400; font-weight: bold; padding: 3px 6px;");
+    };
+    NetworkConfigManager::Ipv4Config recommendedNetworkConfig;
+    recommendedNetworkConfig.mode = NetworkConfigManager::Ipv4Mode::Static;
+    recommendedNetworkConfig.address = QStringLiteral("192.168.50.2");
+    recommendedNetworkConfig.prefixLength = 24;
+    setNetworkEditors(recommendedNetworkConfig);
+
+    auto setCommunicationEditors = [&](const CommunicationConfig& config) {
+        const QSignalBlocker blockWebEnabled(ui.btnWebEnable);
+        const QSignalBlocker blockWebPort(ui.sbWebPort);
+        const QSignalBlocker blockTcpEnabled(ui.btnTcpEnable);
+        const QSignalBlocker blockTcpPort(ui.sbTcpPort);
+        ui.btnWebEnable->setChecked(config.webEnabled);
+        ui.sbWebPort->setValue(config.webPort);
+        ui.btnTcpEnable->setChecked(config.tcpEnabled);
+        ui.sbTcpPort->setValue(config.tcpPort);
+    };
+
+    QObject::connect(ui.btnWebEnable, &QPushButton::toggled,
+                     [&](bool) { refreshCommunicationUi(); });
+    QObject::connect(ui.btnTcpEnable, &QPushButton::toggled,
+                     [&](bool) { refreshCommunicationUi(); });
+    QObject::connect(ui.sbWebPort, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                     [&](double) { refreshCommunicationUi(); });
+    QObject::connect(ui.sbTcpPort, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                     [&](double) { refreshCommunicationUi(); });
+    QObject::connect(ui.cmbNetworkIpv4Mode,
+                     QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     [&](int) { markNetworkEditorsDirty(); });
+    QObject::connect(ui.sbNetworkPrefix,
+                     QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                     [&](double) { markNetworkEditorsDirty(); });
+    QObject::connect(ui.chkNetworkGateway, &QCheckBox::toggled,
+                     [&](bool) { markNetworkEditorsDirty(); });
+    QObject::connect(ui.chkNetworkDns, &QCheckBox::toggled,
+                     [&](bool) { markNetworkEditorsDirty(); });
+    for (int i = 0; i < 4; ++i) {
+        QObject::connect(ui.sbNetworkIp[i],
+                         QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                         [&](double) { markNetworkEditorsDirty(); });
+        QObject::connect(ui.sbNetworkGateway[i],
+                         QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                         [&](double) { markNetworkEditorsDirty(); });
+        QObject::connect(ui.sbNetworkDns[i],
+                         QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                         [&](double) { markNetworkEditorsDirty(); });
+    }
+    QObject::connect(&networkConfigManager, &NetworkConfigManager::statusUpdated,
+                     [&](const NetworkConfigManager::NetworkStatus &status) {
+        localNetworkStatus = status;
+        ui.lblNetworkInterface->setText(status.interfaceFound
+            ? status.interfaceName : QStringLiteral("未检测到有线网卡"));
+        ui.lblNetworkIpv4->setText(status.actualIpv4.isEmpty()
+            ? QStringLiteral("尚未获取 IPv4 地址") : status.actualIpv4);
+        const bool connected = status.interfaceFound && status.linkUp && status.linkRunning;
+        ui.lblNetworkLinkState->setText(connected
+            ? QStringLiteral("● 已连接")
+            : (status.interfaceFound ? QStringLiteral("● 未连接")
+                                     : QStringLiteral("● 无网卡")));
+        ui.lblNetworkLinkState->setStyleSheet(connected
+            ? QStringLiteral("font-size: 18px; color: #176B55; font-weight: bold; "
+                             "background: #E8F8F3; border: 1px solid #A9DFCF; "
+                             "border-radius: 6px; padding: 4px 8px;")
+            : QStringLiteral("font-size: 18px; color: #A93226; font-weight: bold; "
+                             "background: #FDEDEC; border: 1px solid #F5B7B1; "
+                             "border-radius: 6px; padding: 4px 8px;"));
+        ui.lblNetworkProfile->setText(status.profileFound
+            ? status.profileName : QStringLiteral("未找到"));
+
+        if (forceLoadNetworkEditors && status.profileQueryComplete) {
+            setNetworkEditors(status.profileFound
+                ? status.configuredIpv4 : recommendedNetworkConfig);
+            forceLoadNetworkEditors = false;
+        }
+        if (!status.profileQueryComplete) {
+            ui.lblNetworkOperationStatus->setText(
+                QStringLiteral("正在读取 NetworkManager 配置..."));
+            ui.lblNetworkOperationStatus->setStyleSheet(
+                "font-size: 16px; color: #526471; font-weight: bold; padding: 3px 6px;");
+        } else if (!status.error.isEmpty()) {
+            ui.lblNetworkOperationStatus->setText(status.error);
+            ui.lblNetworkOperationStatus->setStyleSheet(
+                "font-size: 16px; color: #A93226; font-weight: bold; padding: 3px 6px;");
+        } else if (!networkOperationResult.isEmpty()) {
+            ui.lblNetworkOperationStatus->setText(networkOperationResult);
+            ui.lblNetworkOperationStatus->setStyleSheet(networkOperationResultIsError
+                ? QStringLiteral("font-size: 16px; color: #A93226; font-weight: bold; padding: 3px 6px;")
+                : QStringLiteral("font-size: 16px; color: #176B55; font-weight: bold; padding: 3px 6px;"));
+        } else if (!networkEditorsDirty) {
+            const QString mode = status.profileFound &&
+                                 status.configuredIpv4.mode ==
+                                     NetworkConfigManager::Ipv4Mode::Dhcp
+                ? QStringLiteral("DHCP") : QStringLiteral("静态 IP");
+            ui.lblNetworkOperationStatus->setText(status.profileFound
+                ? QStringLiteral("NetworkManager 当前模式：%1").arg(mode)
+                : QStringLiteral("尚无可管理配置；应用时将创建 CPC-ETH0。"));
+            ui.lblNetworkOperationStatus->setStyleSheet(
+                "font-size: 16px; color: #526471; font-weight: bold; padding: 3px 6px;");
+        }
+        refreshCommunicationUi();
+    });
+    QObject::connect(&networkConfigManager, &NetworkConfigManager::operationStarted,
+                     [&]() {
+        networkOperationResult.clear();
+        ui.btnNetworkApply->setEnabled(false);
+        ui.btnNetworkReset->setEnabled(false);
+        ui.btnNetworkRefresh->setEnabled(false);
+    });
+    QObject::connect(&networkConfigManager, &NetworkConfigManager::operationProgress,
+                     [&](const QString &message) {
+        ui.lblNetworkOperationStatus->setText(message);
+        ui.lblNetworkOperationStatus->setStyleSheet(
+            "font-size: 16px; color: #9A6400; font-weight: bold; padding: 3px 6px;");
+    });
+    QObject::connect(&networkConfigManager, &NetworkConfigManager::operationSucceeded,
+                     [&](const QString &message) {
+        networkOperationResult = message;
+        networkOperationResultIsError = false;
+        networkEditorsDirty = false;
+        forceLoadNetworkEditors = true;
+        ui.btnNetworkApply->setEnabled(true);
+        ui.btnNetworkReset->setEnabled(true);
+        ui.btnNetworkRefresh->setEnabled(true);
+        ui.lblNetworkOperationStatus->setText(message);
+        ui.lblNetworkOperationStatus->setStyleSheet(
+            "font-size: 16px; color: #176B55; font-weight: bold; padding: 3px 6px;");
+    });
+    QObject::connect(&networkConfigManager, &NetworkConfigManager::operationFailed,
+                     [&](const QString &message, bool) {
+        networkOperationResult = message;
+        networkOperationResultIsError = true;
+        networkEditorsDirty = false;
+        forceLoadNetworkEditors = true;
+        ui.btnNetworkApply->setEnabled(true);
+        ui.btnNetworkReset->setEnabled(true);
+        ui.btnNetworkRefresh->setEnabled(true);
+        ui.lblNetworkOperationStatus->setText(message);
+        ui.lblNetworkOperationStatus->setStyleSheet(
+            "font-size: 16px; color: #A93226; font-weight: bold; padding: 3px 6px;");
+    });
+    QObject::connect(ui.btnNetworkRefresh, &QPushButton::clicked, [&]() {
+        if (networkConfigManager.isBusy()) return;
+        networkOperationResult.clear();
+        forceLoadNetworkEditors = true;
+        ui.lblNetworkOperationStatus->setText(QStringLiteral("正在刷新网络配置..."));
+        networkConfigManager.refresh();
+    });
+    QObject::connect(ui.btnNetworkReset, &QPushButton::clicked, [&]() {
+        networkOperationResult.clear();
+        setNetworkEditors(recommendedNetworkConfig);
+        networkEditorsDirty = true;
+        updateNetworkEditorState();
+        ui.lblNetworkOperationStatus->setText(
+            QStringLiteral("已载入推荐配置；点击“应用网络设置”后才会写入系统。"));
+        ui.lblNetworkOperationStatus->setStyleSheet(
+            "font-size: 16px; color: #9A6400; font-weight: bold; padding: 3px 6px;");
+    });
+    QObject::connect(ui.btnNetworkApply, &QPushButton::clicked, [&]() {
+        if (networkConfigManager.isBusy()) {
+            ui.lblNetworkOperationStatus->setText(
+                QStringLiteral("正在读取或应用网络配置，请稍候。"));
+            return;
+        }
+        const NetworkConfigManager::Ipv4Config requested = readNetworkEditors();
+        QString validationError;
+        if (!NetworkConfigManager::validateConfig(requested, &validationError)) {
+            ui.lblNetworkOperationStatus->setText(validationError);
+            ui.lblNetworkOperationStatus->setStyleSheet(
+                "font-size: 16px; color: #A93226; font-weight: bold; padding: 3px 6px;");
+            return;
+        }
+
+        const NetworkConfigManager::Ipv4Config current =
+            localNetworkStatus.configuredIpv4;
+        const bool sameMode = localNetworkStatus.profileFound &&
+                              localNetworkStatus.profileName == QStringLiteral("CPC-ETH0") &&
+                              current.mode == requested.mode;
+        const bool sameConfig = sameMode &&
+            (requested.mode == NetworkConfigManager::Ipv4Mode::Dhcp ||
+             (current.address == requested.address &&
+              current.prefixLength == requested.prefixLength &&
+              current.gateway == requested.gateway && current.dns == requested.dns));
+        if (sameConfig && (requested.mode == NetworkConfigManager::Ipv4Mode::Dhcp ||
+                           localNetworkStatus.actualIpv4 == requested.address)) {
+            networkEditorsDirty = false;
+            ui.lblNetworkOperationStatus->setText(
+                QStringLiteral("网络配置没有变化，无需重新激活连接。"));
+            ui.lblNetworkOperationStatus->setStyleSheet(
+                "font-size: 16px; color: #176B55; font-weight: bold; padding: 3px 6px;");
+            return;
+        }
+
+        const QString oldAddress = localNetworkStatus.actualIpv4.isEmpty()
+            ? QStringLiteral("尚未获取") : localNetworkStatus.actualIpv4;
+        const QString newAddress = requested.mode == NetworkConfigManager::Ipv4Mode::Dhcp
+            ? QStringLiteral("DHCP 自动获取")
+            : QStringLiteral("%1/%2").arg(requested.address).arg(requested.prefixLength);
+        const bool addressWillChange = requested.mode == NetworkConfigManager::Ipv4Mode::Dhcp ||
+                                       localNetworkStatus.actualIpv4 != requested.address;
+        if (addressWillChange) {
+            QString warning = QStringLiteral(
+                "修改本机 IP 后，当前 Web 看板和工控机 TCP 连接会断开。\n"
+                "需要使用新的 IP 地址重新连接。\n\n当前：%1\n新地址：%2")
+                .arg(oldAddress, newAddress);
+            if (requested.mode == NetworkConfigManager::Ipv4Mode::Static) {
+                warning += QStringLiteral("\n推荐工控机：%1")
+                    .arg(NetworkConfigManager::recommendedIpcAddress(requested));
+            }
+            if (QMessageBox::warning(&window, QStringLiteral("确认修改网络"), warning,
+                                     QMessageBox::Yes | QMessageBox::No,
+                                     QMessageBox::No) != QMessageBox::Yes) {
+                return;
+            }
+        }
+        networkConfigManager.applyConfig(requested);
+    });
+    QObject::connect(&remoteDashboard, &RemoteDashboard::listeningChanged,
+                     [&](bool) { refreshCommunicationUi(); });
+    QObject::connect(&remoteDashboard, &RemoteDashboard::errorOccurred,
+                     [&](const QString& message) {
+                         webServiceError = message;
+                         refreshCommunicationUi();
+                     });
+    QObject::connect(&cpcTcpServer, &CpcTcpServer::listeningChanged,
+                     [&](bool) { refreshCommunicationUi(); });
+    QObject::connect(&cpcTcpServer, &CpcTcpServer::clientConnected,
+                     [&](const QString&) { refreshCommunicationUi(); });
+    QObject::connect(&cpcTcpServer, &CpcTcpServer::clientDisconnected,
+                     refreshCommunicationUi);
+    QObject::connect(&cpcTcpServer, &CpcTcpServer::errorOccurred,
+                     [&](const QString& message) {
+                         tcpServiceError = message;
+                         refreshCommunicationUi();
+                     });
+    QObject::connect(&cpcTcpServer, &CpcTcpServer::frameSent,
+                     [&](quint32 sequence, const QDateTime& sentAt) {
+                         lastTcpSequence = sequence;
+                         lastTcpSentAt = sentAt;
+                         refreshCommunicationUi();
+                     });
+
+    QObject::connect(ui.btnCommunicationReset, &QPushButton::clicked, [&]() {
+        CommunicationConfig defaults;
+        setCommunicationEditors(defaults);
+        refreshCommunicationUi();
+    });
+    QObject::connect(ui.btnCommunicationApply, &QPushButton::clicked, [&]() {
+        CommunicationConfig requested;
+        requested.webEnabled = ui.btnWebEnable->isChecked();
+        requested.webPort = static_cast<quint16>(ui.sbWebPort->value());
+        requested.tcpEnabled = ui.btnTcpEnable->isChecked();
+        requested.tcpPort = static_cast<quint16>(ui.sbTcpPort->value());
+
+        if (requested.webPort < MIN_SERVICE_PORT || requested.tcpPort < MIN_SERVICE_PORT) {
+            ui.lblCommunicationApplyStatus->setText("服务端口必须在 1024～65535 范围内。");
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #A93226; font-weight: bold; padding: 6px 10px; "
+                "background: #FDEDEC; border: 1px solid #F5B7B1; border-radius: 7px;");
+            return;
+        }
+        if (requested.webPort == requested.tcpPort) {
+            ui.lblCommunicationApplyStatus->setText(
+                "Web远程看板和工控机TCP不能使用相同端口。");
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #A93226; font-weight: bold; padding: 6px 10px; "
+                "background: #FDEDEC; border: 1px solid #F5B7B1; border-radius: 7px;");
+            return;
+        }
+        if (!communicationUiIsDirty()) {
+            ui.lblCommunicationApplyStatus->setText("配置没有变化，无需重启服务。");
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #176B55; font-weight: bold; padding: 6px 10px;");
+            return;
+        }
+
+        const CommunicationConfig previous = communicationConfig;
+        const bool webRuntimeChanged =
+            previous.webEnabled != requested.webEnabled ||
+            (requested.webEnabled && previous.webPort != requested.webPort);
+        const bool tcpRuntimeChanged =
+            previous.tcpEnabled != requested.tcpEnabled ||
+            (requested.tcpEnabled && previous.tcpPort != requested.tcpPort);
+
+        if (webRuntimeChanged && remoteDashboard.isListening()) remoteDashboard.stop();
+        if (tcpRuntimeChanged && cpcTcpServer.isListening()) cpcTcpServer.stop();
+
+        bool applySucceeded = true;
+        QString failedService;
+        QString applyError;
+        if (webRuntimeChanged && requested.webEnabled) {
+            webServiceError.clear();
+            if (!remoteDashboard.start(requested.webPort, &applyError)) {
+                applySucceeded = false;
+                failedService = QStringLiteral("Web 远程看板端口 %1").arg(requested.webPort);
+                webServiceError = applyError;
+            }
+        }
+        if (applySucceeded && tcpRuntimeChanged && requested.tcpEnabled) {
+            tcpServiceError.clear();
+            if (!cpcTcpServer.start(requested.tcpPort, &applyError)) {
+                applySucceeded = false;
+                failedService = QStringLiteral("工控机 TCP 端口 %1").arg(requested.tcpPort);
+                tcpServiceError = applyError;
+            }
+        }
+
+        if (!applySucceeded) {
+            if (webRuntimeChanged && remoteDashboard.isListening()) remoteDashboard.stop();
+            if (tcpRuntimeChanged && cpcTcpServer.isListening()) cpcTcpServer.stop();
+
+            QStringList rollbackProblems;
+            if (webRuntimeChanged && previous.webEnabled) {
+                QString rollbackError;
+                if (!remoteDashboard.start(previous.webPort, &rollbackError)) {
+                    webServiceError = rollbackError;
+                    rollbackProblems << QStringLiteral("Web %1 恢复失败：%2")
+                                            .arg(previous.webPort).arg(rollbackError);
+                } else {
+                    webServiceError.clear();
+                }
+            }
+            if (tcpRuntimeChanged && previous.tcpEnabled) {
+                QString rollbackError;
+                if (!cpcTcpServer.start(previous.tcpPort, &rollbackError)) {
+                    tcpServiceError = rollbackError;
+                    rollbackProblems << QStringLiteral("TCP %1 恢复失败：%2")
+                                            .arg(previous.tcpPort).arg(rollbackError);
+                } else {
+                    tcpServiceError.clear();
+                }
+            }
+            setCommunicationEditors(previous);
+            refreshCommunicationUi();
+            const QString rollbackResult = rollbackProblems.isEmpty()
+                ? QStringLiteral("已恢复原配置（Web %1，TCP %2）。")
+                      .arg(previous.webPort).arg(previous.tcpPort)
+                : QStringLiteral("回滚也失败：%1").arg(rollbackProblems.join(QStringLiteral("；")));
+            const QString message = QStringLiteral("%1 启动失败：%2；%3")
+                                        .arg(failedService, applyError, rollbackResult);
+            ui.lblCommunicationApplyStatus->setText(message);
+            ui.lblCommunicationApplyStatus->setStyleSheet(
+                "font-size: 17px; color: #A93226; font-weight: bold; padding: 6px 10px; "
+                "background: #FDEDEC; border: 1px solid #F5B7B1; border-radius: 7px;");
+            qWarning().noquote() << message;
+            return;
+        }
+
+        communicationConfig = requested;
+        webServiceError.clear();
+        tcpServiceError.clear();
+        pidSettings.setValue("communication/web/enabled", communicationConfig.webEnabled);
+        pidSettings.setValue("communication/web/port", communicationConfig.webPort);
+        pidSettings.setValue("communication/tcp/enabled", communicationConfig.tcpEnabled);
+        pidSettings.setValue("communication/tcp/port", communicationConfig.tcpPort);
+        pidSettings.sync();
+        refreshCommunicationUi();
+        const bool settingsSaved = pidSettings.status() == QSettings::NoError;
+        ui.lblCommunicationApplyStatus->setText(settingsSaved
+            ? QStringLiteral("通讯设置已应用并保存。")
+            : QStringLiteral("通讯设置已应用，但保存失败，下次启动可能不会恢复。"));
+        ui.lblCommunicationApplyStatus->setStyleSheet(settingsSaved
+            ? QStringLiteral("font-size: 17px; color: #176B55; font-weight: bold; padding: 6px 10px;")
+            : QStringLiteral("font-size: 17px; color: #A93226; font-weight: bold; padding: 6px 10px;"));
+    });
+
+    QTimer *networkRefreshTimer = new QTimer(&window);
+    networkRefreshTimer->setInterval(5000);
+    QObject::connect(networkRefreshTimer, &QTimer::timeout, [&]() {
+        if (!networkConfigManager.isBusy()) networkConfigManager.refresh();
+    });
+    networkRefreshTimer->start();
+    networkConfigManager.refresh();
+
     auto saveOpcAlgorithmSettings = [&]() {
         pidSettings.setValue("opc_algorithm/min_range", opcParams.minRange);
         pidSettings.setValue("opc_algorithm/threshold_offset", opcParams.thresholdOffset);
@@ -510,6 +1137,9 @@ int main(int argc, char *argv[]) {
             hasLatestParticleConcentration = true;
             remoteDashboard.publishParticleConcentration(
                 latestParticleConcentrationTime,
+                latestParticleConcentration,
+                latestParticleConcentrationValid);
+            cpcTcpServer.publishParticleResult(
                 latestParticleConcentration,
                 latestParticleConcentrationValid);
         }
@@ -1731,6 +2361,8 @@ int main(int argc, char *argv[]) {
     QObject::connect(&app, &QCoreApplication::aboutToQuit, [&]() {
         stopRawRecording(false);
         performSafetyShutdown(shutdownTrigger);
+        remoteDashboard.stop();
+        cpcTcpServer.stop();
     });
 
     QTimer terminationSignalTimer;
@@ -1890,6 +2522,8 @@ int main(int argc, char *argv[]) {
         delete liquidSystem;
         liquidSystem = nullptr;
     }
+    remoteDashboard.stop();
+    cpcTcpServer.stop();
     proportional_valve.close();
     vacuum_pump.release();
     opc_heater.release();

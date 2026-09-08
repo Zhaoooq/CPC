@@ -17,6 +17,7 @@ public:
     explicit RemoteDashboard(QObject *parent = nullptr);
 
     bool start(quint16 port = 8080, QString *errorMessage = nullptr);
+    void stop();
     void setAcquiring(bool acquiring);
     void resetMeasurements();
     void publishParticleConcentration(double acquisitionTimeSeconds,
@@ -25,6 +26,10 @@ public:
 
     bool isListening() const;
     quint16 serverPort() const;
+
+signals:
+    void listeningChanged(bool listening);
+    void errorOccurred(const QString &message);
 
 private slots:
     void acceptPendingConnections();
