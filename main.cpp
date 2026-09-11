@@ -38,10 +38,10 @@
 #include <lgpio.h>
 
 #include "LiquidControlSystem.h"
+#include "acquisition/AcquisitionController.h"
 #include "algorithms/OpcCounter.h"
 #include "control/PressureValveController.h"
 #include "control/TemperaturePid.h"
-#include "daq_worker.h"
 #include "hardware/Ads1115PressureSensor.h"
 #include "hardware/N4IOA01Valve.h"
 #include "hardware/PT100Sensor.h"
@@ -137,6 +137,7 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
     qRegisterMetaType<QVector<double>>("QVector<double>");
+    qRegisterMetaType<OpcProcessedChunk>("OpcProcessedChunk");
     std::signal(SIGINT, handleTerminationSignal);
     std::signal(SIGTERM, handleTerminationSignal);
     std::signal(SIGHUP, handleTerminationSignal);
@@ -863,7 +864,8 @@ int main(int argc, char *argv[]) {
     QObject::connect(ui.sbOpcWindowMs,
                      QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                      [&](double) { saveOpcAlgorithmSettings(); });
-    DaqWorker *daqWorker = new DaqWorker();
+    AcquisitionController *acquisitionController = new AcquisitionController();
+    acquisitionController->setParticleCalibration(particleCalibration);
     bool shutdownRequested = false;
     QString shutdownTrigger = QStringLiteral("正常退出");
     StartupPhase startupPhase = StartupPhase::SelfCheck;
@@ -893,7 +895,7 @@ int main(int argc, char *argv[]) {
         ui.btnShutdown->setEnabled(false);
         ui.lblStatus->setText("状态: 正在安全关闭设备...");
         remoteDashboard.setAcquiring(false);
-        daqWorker->stopDaq();
+        acquisitionController->stop();
         app.quit();
     });
 
@@ -905,48 +907,20 @@ int main(int argc, char *argv[]) {
     bool &particlePlotFollowLatest = acquisitionState.particlePlotFollowLatest;
     bool &particlePlotAutoY = acquisitionState.particlePlotAutoY;
     double &latestParticleConcentration = acquisitionState.latestParticleConcentration;
-    double &smoothedParticleConcentration = acquisitionState.smoothedParticleConcentration;
     double &latestParticleConcentrationTime = acquisitionState.latestParticleConcentrationTime;
 
     QVector<double> opcDisplayTimeBuffer;
     QVector<double> opcDisplayVoltageBuffer;
     QVector<double> opcPeakTimeBuffer;
     QVector<double> opcPeakVoltageBuffer;
-    constexpr double PARTICLE_DISPLAY_SMOOTHING_ALPHA = 0.65;
-    ParticleCountRateAccumulator particleCountRateAccumulator(1.0);
     constexpr double OPC_DISPLAY_WINDOW_SECONDS = 0.05;
-    constexpr int OPC_DISPLAY_POINTS_PER_CHUNK = 1000;
     constexpr int OPC_PLOT_REFRESH_INTERVAL_MS = 33; // 约 30 FPS，兼顾树莓派上的平滑度与负载。
-    QFile rawRecordingFile;
     bool rawRecordingActive = false;
-    qint64 rawRecordedSampleCount = 0;
-    QElapsedTimer rawRecordingFlushTimer;
     auto stopRawRecording = [&](bool showCompletionMessage) {
         if (!rawRecordingActive) return;
-
-        const QString fileName = rawRecordingFile.fileName();
-        const bool flushSucceeded = rawRecordingFile.flush();
-        const QString flushError = rawRecordingFile.errorString();
-        rawRecordingFile.close();
         rawRecordingActive = false;
+        acquisitionController->stopRecording(showCompletionMessage);
         updateAcqUi();
-
-        if (!flushSucceeded) {
-            const QString message = QString("关闭 CSV 文件时写入失败，文件可能不完整。\n%1")
-                .arg(flushError);
-            if (showCompletionMessage) {
-                QMessageBox::warning(&window, "保存失败", message);
-            } else {
-                qWarning().noquote() << message;
-            }
-        } else if (showCompletionMessage) {
-            QMessageBox::information(
-                &window,
-                "保存完成",
-                QString("本段数据已保存。\n采样点：%1\n文件：%2")
-                    .arg(rawRecordedSampleCount)
-                    .arg(QDir::toNativeSeparators(fileName)));
-        }
     };
     bool hasLatestAdaptiveThreshold = false;
     double latestAdaptiveBaseline = 0.0;
@@ -973,9 +947,8 @@ int main(int argc, char *argv[]) {
 
         // 避免新旧标定尺度在指数平滑中混合。
         latestParticleConcentration = std::numeric_limits<double>::quiet_NaN();
-        smoothedParticleConcentration = std::numeric_limits<double>::quiet_NaN();
         latestParticleConcentrationValid = false;
-        particleCountRateAccumulator.reset();
+        acquisitionController->setParticleCalibration(particleCalibration);
         updateParticleCalibrationStatus(
             pidSettings.status() == QSettings::NoError
                 ? (restoredDefault ? QStringLiteral("已恢复默认并保存")
@@ -994,7 +967,7 @@ int main(int argc, char *argv[]) {
     updateParticleCalibrationStatus(QStringLiteral("当前已加载"));
 
     updateAcqUi = [&]() {
-        const bool workerRunning = daqWorker->isRunning();
+        const bool workerRunning = acquisitionController->isWorkerRunning();
         const bool isStopping = workerRunning && !is_acquiring;
         ui.btnAcqStart->setEnabled(
             !is_acquiring && !workerRunning);
@@ -1021,7 +994,8 @@ int main(int argc, char *argv[]) {
         }
     };
 
-    QObject::connect(daqWorker, &QThread::finished, &window, [&]() {
+    QObject::connect(acquisitionController, &AcquisitionController::acquisitionFinished,
+                     &window, [&]() {
         stopRawRecording(true);
         is_acquiring = false;
         remoteDashboard.setAcquiring(false);
@@ -1029,52 +1003,13 @@ int main(int argc, char *argv[]) {
         updateAcqUi();
     });
 
-    QObject::connect(daqWorker, &DaqWorker::dataReady, ui.opcPlot, [&](QVector<double> time, QVector<double> voltage) {
-        if (!is_acquiring || time.isEmpty()) return;
+    QObject::connect(acquisitionController, &AcquisitionController::processedChunkReady,
+                     ui.opcPlot, [&](const OpcProcessedChunk& processed) {
+        if (!is_acquiring || processed.displayTime.isEmpty()) return;
+        const QVector<double>& time = processed.displayTime;
+        const QVector<double>& voltage = processed.displayVoltage;
 
-        if (rawRecordingActive) {
-            const int sampleCount = qMin(time.size(), voltage.size());
-            QByteArray csvChunk;
-            csvChunk.reserve(sampleCount * 24);
-            for (int i = 0; i < sampleCount; ++i) {
-                csvChunk.append(QByteArray::number(time.at(i), 'f', 6));
-                csvChunk.append(',');
-                csvChunk.append(QByteArray::number(voltage.at(i), 'f', 5));
-                csvChunk.append('\n');
-            }
-
-            const qint64 bytesWritten = rawRecordingFile.write(csvChunk);
-            if (bytesWritten != csvChunk.size()) {
-                const QString error = rawRecordingFile.errorString();
-                rawRecordingFile.flush();
-                rawRecordingFile.close();
-                rawRecordingActive = false;
-                updateAcqUi();
-                QMessageBox::warning(
-                    &window,
-                    "数据保存中断",
-                    QString("写入 CSV 文件失败，已停止保存。\n%1").arg(error));
-            } else {
-                rawRecordedSampleCount += sampleCount;
-                if (rawRecordingFlushTimer.elapsed() >= 1000) {
-                    if (!rawRecordingFile.flush()) {
-                        const QString error = rawRecordingFile.errorString();
-                        rawRecordingFile.close();
-                        rawRecordingActive = false;
-                        updateAcqUi();
-                        QMessageBox::warning(
-                            &window,
-                            "数据保存中断",
-                            QString("刷新 CSV 文件失败，已停止保存。\n%1").arg(error));
-                    } else {
-                        rawRecordingFlushTimer.restart();
-                    }
-                }
-            }
-        }
-
-        int displayStride = qMax(1, time.size() / OPC_DISPLAY_POINTS_PER_CHUNK);
-        for (int i = 0; i < time.size() && i < voltage.size(); i += displayStride) {
+        for (int i = 0; i < time.size() && i < voltage.size(); ++i) {
             opcDisplayTimeBuffer.append(time.at(i));
             opcDisplayVoltageBuffer.append(voltage.at(i));
         }
@@ -1089,7 +1024,7 @@ int main(int argc, char *argv[]) {
             opcDisplayVoltageBuffer.remove(0, firstDisplayPoint);
         }
 
-        OpcCountResult opcResult = analyzeOpcPulseSignal(time, voltage, opcParams);
+        const OpcCountResult& opcResult = processed.countResult;
         if (opcResult.adaptiveThresholdValid) {
             latestAdaptiveBaseline = opcResult.currentBaseline;
             latestAdaptiveNoiseRange = opcResult.currentNoiseRange;
@@ -1110,42 +1045,20 @@ int main(int argc, char *argv[]) {
         }
         hasLatestOpcFrame = true;
 
-        // 累计至少 1 秒的完整数据块后才结算一次颗粒计数速率，
-        // 避免将约 20 ms 的短块速率以 100 ms 频率刷新到主界面。
-        double rawOneSecondCountRate = 0.0;
-        const double chunkDurationSeconds = estimateChunkDurationSeconds(time);
-        if (particleCountRateAccumulator.addChunk(
-                opcResult.totalCount, chunkDurationSeconds, rawOneSecondCountRate)) {
-            const double calibratedParticleValue =
-                applyParticleCountCalibration(rawOneSecondCountRate, particleCalibration);
-            if (std::isfinite(calibratedParticleValue)) {
-                if (std::isfinite(smoothedParticleConcentration)) {
-                    smoothedParticleConcentration =
-                        PARTICLE_DISPLAY_SMOOTHING_ALPHA * calibratedParticleValue +
-                        (1.0 - PARTICLE_DISPLAY_SMOOTHING_ALPHA) * smoothedParticleConcentration;
-                } else {
-                    smoothedParticleConcentration = calibratedParticleValue;
-                }
-                latestParticleConcentration = smoothedParticleConcentration;
-                latestParticleConcentrationValid = std::isfinite(latestParticleConcentration);
-            } else {
-                latestParticleConcentration = std::numeric_limits<double>::quiet_NaN();
-                smoothedParticleConcentration = std::numeric_limits<double>::quiet_NaN();
-                latestParticleConcentrationValid = false;
-            }
-            latestParticleConcentrationTime = time.last();
-            hasLatestParticleConcentration = true;
-            remoteDashboard.publishParticleConcentration(
-                latestParticleConcentrationTime,
-                latestParticleConcentration,
-                latestParticleConcentrationValid);
-            cpcTcpServer.publishParticleResult(
-                latestParticleConcentration,
-                latestParticleConcentrationValid);
-        }
     }, Qt::QueuedConnection);
 
-    QObject::connect(daqWorker, &DaqWorker::errorOccurred, &window, [&](const QString& msg) {
+    QObject::connect(acquisitionController, &AcquisitionController::particleResultReady,
+                     &window, [&](double sampleTime, double value, bool valid) {
+        latestParticleConcentrationTime = sampleTime;
+        latestParticleConcentration = value;
+        latestParticleConcentrationValid = valid;
+        hasLatestParticleConcentration = true;
+        remoteDashboard.publishParticleConcentration(sampleTime, value, valid);
+        cpcTcpServer.publishParticleResult(value, valid);
+    });
+
+    QObject::connect(acquisitionController, &AcquisitionController::acquisitionError,
+                     &window, [&](const QString& msg) {
         stopRawRecording(false);
         is_acquiring = false;
         remoteDashboard.setAcquiring(false);
@@ -1174,7 +1087,7 @@ int main(int argc, char *argv[]) {
             notReadyBox.exec();
             if (notReadyBox.clickedButton() != continueButton) return;
         }
-        if (daqWorker->isRunning()) return;
+        if (acquisitionController->isWorkerRunning()) return;
         QString pumpError;
         if (!startPumpAtFullPower || !startPumpAtFullPower(&pumpError)) {
             QMessageBox::critical(
@@ -1190,10 +1103,8 @@ int main(int argc, char *argv[]) {
         opcPeakVoltageBuffer.clear();
         hasLatestOpcFrame = false;
         latestParticleConcentration = std::numeric_limits<double>::quiet_NaN();
-        smoothedParticleConcentration = std::numeric_limits<double>::quiet_NaN();
         hasLatestParticleConcentration = false;
         latestParticleConcentrationValid = false;
-        particleCountRateAccumulator.reset();
         particlePlotFollowLatest = true;
         particlePlotAutoY = true;
         setOpcPlotAutoView(ui.opcPlot, true);
@@ -1209,15 +1120,19 @@ int main(int argc, char *argv[]) {
         is_acquiring = true;
         remoteDashboard.resetMeasurements();
         remoteDashboard.setAcquiring(true);
-        daqWorker->startDaq();
+        if (!acquisitionController->start(opcParams)) {
+            is_acquiring = false;
+            remoteDashboard.setAcquiring(false);
+            stopPumpSafely();
+        }
         updateAcqUi();
     });
 
     QObject::connect(ui.btnAcqStop, &QPushButton::clicked, [&]() {
-        if (!is_acquiring && !daqWorker->isRunning()) return;
+        if (!is_acquiring && !acquisitionController->isWorkerRunning()) return;
         is_acquiring = false;
         remoteDashboard.setAcquiring(false);
-        daqWorker->stopDaq();
+        acquisitionController->stop();
         stopPumpSafely();
         stopRawRecording(true);
         updateAcqUi();
@@ -1374,30 +1289,32 @@ int main(int argc, char *argv[]) {
             "CSV 文件 (*.csv)");
         if (fileName.isEmpty()) return;
 
-        rawRecordingFile.setFileName(fileName);
-        if (!rawRecordingFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QMessageBox::warning(
-                &window,
-                "保存失败",
-                QString("无法打开文件进行写入。\n%1").arg(rawRecordingFile.errorString()));
-            return;
-        }
-
-        const QByteArray csvHeader("Time(s),Voltage(V)\n");
-        if (rawRecordingFile.write(csvHeader) != csvHeader.size()) {
-            const QString error = rawRecordingFile.errorString();
-            rawRecordingFile.close();
-            QMessageBox::warning(
-                &window,
-                "保存失败",
-                QString("无法写入 CSV 文件。\n%1").arg(error));
-            return;
-        }
-
-        rawRecordedSampleCount = 0;
+        if (!acquisitionController->startRecording(fileName)) return;
         rawRecordingActive = true;
-        rawRecordingFlushTimer.restart();
         updateAcqUi();
+    });
+
+    QObject::connect(acquisitionController, &AcquisitionController::recordingError,
+                     &window, [&](const QString& message) {
+        rawRecordingActive = false;
+        updateAcqUi();
+        QMessageBox::warning(&window, "数据保存中断", message);
+    });
+    QObject::connect(acquisitionController, &AcquisitionController::recordingStopped,
+                     &window, [&](const QString& fileName, qint64 sampleCount,
+                                  bool success, const QString& error,
+                                  bool showCompletionMessage) {
+        if (!showCompletionMessage) return;
+        if (!success) {
+            QMessageBox::warning(&window, "保存失败",
+                                 QString("关闭 CSV 文件时写入失败，文件可能不完整。\n%1")
+                                     .arg(error));
+        } else {
+            QMessageBox::information(
+                &window, "保存完成",
+                QString("本段数据已保存。\n采样点：%1\n文件：%2")
+                    .arg(sampleCount).arg(QDir::toNativeSeparators(fileName)));
+        }
     });
 
     updateAcqUi();
@@ -2309,7 +2226,7 @@ int main(int argc, char *argv[]) {
         pressureControlTimer.stop();
         plotRefreshTimer->stop();
         opcPlotRefreshTimer->stop();
-        daqWorker->stopDaq();
+        acquisitionController->stop();
         results << "[成功] 已请求停止数据采集与全部控制定时器";
 
         is_cond_running = false;
@@ -2377,17 +2294,22 @@ int main(int argc, char *argv[]) {
     });
     terminationSignalTimer.start();
 
+    QElapsedTimer temperatureControlClock;
+    temperatureControlClock.start();
     QObject::connect(timer, &QTimer::timeout, [&]() {
+        const double controlDtSeconds =
+            static_cast<double>(temperatureControlClock.nsecsElapsed()) / 1.0e9;
+        temperatureControlClock.restart();
         float t_cond = cond_sensor.read_temperature();
         float t_sat = sat_sensor.read_temperature();
         float t_opc = opc_sensor.read_temperature();
         constexpr double MIN_VALID_TEMP_C = -50.0;
         constexpr double MAX_VALID_TEMP_C = 150.0;
-        condTemperatureValid = std::isfinite(t_cond) &&
+        condTemperatureValid = cond_sensor.isReady() && !cond_sensor.hasFault() && std::isfinite(t_cond) &&
             t_cond >= MIN_VALID_TEMP_C && t_cond <= MAX_VALID_TEMP_C;
-        satTemperatureValid = std::isfinite(t_sat) &&
+        satTemperatureValid = sat_sensor.isReady() && !sat_sensor.hasFault() && std::isfinite(t_sat) &&
             t_sat >= MIN_VALID_TEMP_C && t_sat <= MAX_VALID_TEMP_C;
-        opcTemperatureValid = std::isfinite(t_opc) &&
+        opcTemperatureValid = opc_sensor.isReady() && !opc_sensor.hasFault() && std::isfinite(t_opc) &&
             t_opc >= MIN_VALID_TEMP_C && t_opc <= MAX_VALID_TEMP_C;
         double p_cond = 0.0;
         double p_sat = 0.0;
@@ -2397,9 +2319,10 @@ int main(int argc, char *argv[]) {
             peltier_cond.set_duty_cycle(0.0);
             is_cond_running = false;
             cond_pid.reset();
-            ui.lblCondPwm->setToolTip("冷凝段 PT100 读数无效或超出 -50～150 ℃，输出已关闭。");
+            ui.lblCondPwm->setToolTip(QString("冷凝段 PT100 故障，输出已关闭：%1")
+                                          .arg(cond_sensor.errorString()));
         } else if (is_cond_running) {
-            p_cond = cond_pid.compute(t_cond, 0.5);
+            p_cond = cond_pid.compute(t_cond, controlDtSeconds);
             if (!peltier_cond.set_duty_cycle(p_cond)) {
                 is_cond_running = false;
                 p_cond = 0.0;
@@ -2412,9 +2335,10 @@ int main(int argc, char *argv[]) {
             heater_sat.set_duty_cycle(0.0);
             is_sat_running = false;
             sat_pid.reset();
-            ui.lblSatPwm->setToolTip("饱和段 PT100 读数无效或超出 -50～150 ℃，输出已关闭。");
+            ui.lblSatPwm->setToolTip(QString("饱和段 PT100 故障，输出已关闭：%1")
+                                         .arg(sat_sensor.errorString()));
         } else if (is_sat_running) {
-            p_sat = sat_pid.compute(t_sat, 0.5);
+            p_sat = sat_pid.compute(t_sat, controlDtSeconds);
             if (!heater_sat.set_duty_cycle(p_sat)) {
                 is_sat_running = false;
                 p_sat = 0.0;
@@ -2432,9 +2356,11 @@ int main(int argc, char *argv[]) {
                 ui.btnOpcStart->setEnabled(false);
                 ui.btnOpcStop->setEnabled(false);
                 ui.lblOpcPwm->setToolTip(stopped
-                    ? "OPC 段 PT100 读数无效或超出 -50～150 ℃，加热已自动关闭；读数恢复后请手动重新启动。"
-                    : QString("OPC 段 PT100 读数无效或超出 -50～150 ℃，且 PWM 关闭失败：%1")
-                        .arg(QString::fromStdString(opc_heater.errorString())));
+                    ? QString("OPC 段 PT100 故障，加热已自动关闭；读数恢复后请手动重新启动：%1")
+                          .arg(opc_sensor.errorString())
+                    : QString("OPC 段 PT100 故障，且 PWM 关闭失败：%1；传感器：%2")
+                        .arg(QString::fromStdString(opc_heater.errorString()),
+                             opc_sensor.errorString()));
             } else if (t_opc >= opc_pid.target + OPC_OVERTEMP_MARGIN_C) {
                 const bool stopped = opc_heater.set_duty_cycle(0.0);
                 if (!stopped) opcHeaterReady = false;
@@ -2446,7 +2372,7 @@ int main(int argc, char *argv[]) {
                     : QString("OPC 超温且 PWM 关闭失败：%1")
                           .arg(QString::fromStdString(opc_heater.errorString())));
             } else {
-                p_opc = opc_pid.compute(t_opc, 0.5);
+                p_opc = opc_pid.compute(t_opc, controlDtSeconds);
                 if (!opc_heater.set_duty_cycle(p_opc)) {
                     const QString writeError = QString::fromStdString(opc_heater.errorString());
                     const bool stopped = opc_heater.set_duty_cycle(0.0);
@@ -2528,14 +2454,8 @@ int main(int argc, char *argv[]) {
     vacuum_pump.release();
     opc_heater.release();
     bypass_valve.release();
-    daqWorker->stopDaq();
-    if (!daqWorker->wait(6000)) {
-        // D2XX 调用理论上会在读取超时后返回。若驱动异常导致超时仍未结束，
-        // 退出阶段最后中止采集线程，避免整个程序永久卡在关闭流程。
-        daqWorker->terminate();
-        daqWorker->wait(1000);
-    }
-    if (!daqWorker->isRunning()) delete daqWorker;
+    acquisitionController->shutdown();
+    delete acquisitionController;
     plotRefreshTimer->stop();
     delete plotRefreshTimer;
     opcPlotRefreshTimer->stop();

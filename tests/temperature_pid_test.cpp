@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -32,6 +33,19 @@ PredictiveHeatingPID makeOpcController() {
 } // namespace
 
 int main() {
+    for (double dt : {0.3, 0.5, 0.8}) {
+        auto heating = makeOpcController();
+        const double output = heating.compute(35.0, dt);
+        assert(std::isfinite(output) && output >= 0.0 && output <= 50.0);
+    }
+    for (double dt : {0.0, -0.5, std::numeric_limits<double>::quiet_NaN(), 10.0}) {
+        auto saturation = makeSaturationController();
+        auto opc = makeOpcController();
+        HybridCoolingPID cooling;
+        assert(saturation.compute(35.0, dt) == 0.0);
+        assert(opc.compute(35.0, dt) == 0.0);
+        assert(cooling.compute(12.0, dt) == 0.0);
+    }
     {
         auto pid = makeSaturationController();
         // The pair of saturation heaters must no longer receive 100% during

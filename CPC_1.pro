@@ -1,12 +1,15 @@
 QT += widgets printsupport network
 
-CONFIG += c++11
+CONFIG += c++17
 CONFIG -= app_bundle
+
+QMAKE_CXXFLAGS += -Wall -Wextra -Wpedantic -Wshadow
 
 TEMPLATE = app
 TARGET = CPC_1
 
 INCLUDEPATH += . \
+    acquisition \
     hardware \
     control \
     algorithms \
@@ -15,6 +18,10 @@ INCLUDEPATH += . \
 
 SOURCES += \
     main.cpp \
+    acquisition/daq_worker.cpp \
+    acquisition/AcquisitionController.cpp \
+    acquisition/OpcProcessingWorker.cpp \
+    acquisition/RawDataWriter.cpp \
     algorithms/OpcCounter.cpp \
     control/PressureValveController.cpp \
     hardware/Ads1115PressureSensor.cpp \
@@ -31,13 +38,16 @@ SOURCES += \
     ui/TouchDoubleSpinBox.cpp \
     ui/WatermarkWidget.cpp \
     qcustomplot.cpp \
-    LiquidControlSystem.cpp
+    control/LiquidControlSystem.cpp
 
 HEADERS += \
+    acquisition/AcquisitionController.h \
+    acquisition/OpcProcessingWorker.h \
+    acquisition/RawDataWriter.h \
     algorithms/OpcCounter.h \
     control/PressureValveController.h \
     control/TemperaturePid.h \
-    daq_worker.h \
+    acquisition/daq_worker.h \
     hardware/Ads1115PressureSensor.h \
     hardware/N4IOA01Valve.h \
     hardware/PT100Sensor.h \
@@ -54,7 +64,7 @@ HEADERS += \
     ui/TouchDoubleSpinBox.h \
     ui/WatermarkWidget.h \
     qcustomplot.h \
-    LiquidControlSystem.h
+    control/LiquidControlSystem.h
 
 RESOURCES += resources.qrc
 

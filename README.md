@@ -245,13 +245,17 @@ flowchart TB
 CPC/
 ├── main.cpp                         # 程序入口、硬件生命周期、信号连接和安全退出
 ├── CPC_1.pro                        # Qt/qmake 工程配置
-├── daq_worker.h                     # FTDI/ADS8688 高速采集线程
-├── LiquidControlSystem.*            # 液位监控、自动补液和手动排液
+├── acquisition/
+│   ├── daq_worker.*                 # FTDI/ADS8688 高速采集线程
+│   ├── AcquisitionController.*      # 采集生命周期与线程协调
+│   ├── OpcProcessingWorker.*        # OPC 数据处理线程
+│   └── RawDataWriter.*              # 原始数据异步写盘
 ├── algorithms/
 │   └── OpcCounter.*                 # OPC 动态阈值、峰识别和计数
 ├── control/
+│   ├── LiquidControlSystem.*        # 液位监控、自动补液和手动排液
 │   ├── TemperaturePid.h             # 三段预测式温控算法
-│   └── PressureValveController.*     # 压差 PI 控制器
+│   └── PressureValveController.*    # 压差 PI 控制器
 ├── hardware/
 │   ├── Ads1115PressureSensor.*       # 三路压差采集、校零和滤波
 │   ├── N4IOA01Valve.*               # Modbus RTU 4–20 mA 比例阀模块
@@ -273,6 +277,9 @@ CPC/
 ├── web/
 │   └── dashboard.html                # Windows 浏览器端实时看板
 ├── deployment/                       # 树莓派开机画面、自动启动和桌面配置
+├── scripts/
+│   └── build-cpc.sh                 # 离源编译并更新实际运行文件
+├── build/                            # qmake/编译生成物（Git 忽略）
 ├── qcustomplot.*                     # QCustomPlot 绘图库
 └── start-cpc-1.sh                    # 桌面自动启动入口
 ```
@@ -283,18 +290,17 @@ CPC/
 
 - Raspberry Pi OS 64-bit / Raspberry Pi 5。
 - Qt 5 Widgets、PrintSupport 与 Network。
-- qmake 和支持 C++11 的 g++。
+- qmake 和支持 C++17 的 g++。
 - `liblgpio`。
 - `liblgpio-dev` 开发头文件。
 - FTDI D2XX 头文件（`ftd2xx.h`、`WinTypes.h`）与工程目录中的 ARMv8 动态库（`libftd2xx`）。
 - Linux I²C、SPI、串口和 sysfs PWM 接口。
 
-构建命令：
+推荐使用项目脚本进行离源构建。所有中间文件都保存在 `build/`，构建成功后才会更新根目录中供开机启动使用的 `CPC_1`：
 
 ```bash
 cd /home/pi/Desktop/CPC
-qmake CPC_1.pro
-make -j2
+./scripts/build-cpc.sh
 ```
 
 生成的程序为：
