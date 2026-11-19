@@ -1680,6 +1680,8 @@ int main(int argc, char *argv[]) {
     pressureControlTimer.setTimerType(Qt::PreciseTimer);
     QElapsedTimer pressureControlElapsed;
     bool pressureControlActive = false;
+    double pressureControlAppliedOpening = 0.0;
+    double pressureControlAppliedCurrent = 4.0;
 
     auto selectedPressureChannel = [&]() {
         const int channel = ui.cmbPressureControlChannel->currentData().toInt();
@@ -1778,10 +1780,19 @@ int main(int argc, char *argv[]) {
         PressureValveController::Parameters parameters;
         parameters.kp = ui.sbPressureKp->value();
         parameters.ki = ui.sbPressureKi->value();
+        // A1: 1 Pa / 500 Pa full scale = 0.2%, independent of target pressure.
         parameters.deadbandPercentOfFullScale = 0.20;
+        // Retain a region beyond tolerance for slow control and ripple rejection.
+        parameters.fineBandPercentOfFullScale = std::max(
+            2.0, 2.0 * parameters.deadbandPercentOfFullScale);
+        // A1 starts from a closed valve: move faster while far from target,
+        // retaining the existing 1 percentage point/s fine-control limit.
+        if (channel == 1) parameters.maxRatePercentPerSecond = 4.0;
         parameters.maxStepPercent = 5.0;
         pressureValveController.setParameters(parameters);
         pressureValveController.reset(initialOpening);
+        pressureControlAppliedOpening = initialOpening;
+        pressureControlAppliedCurrent = confirmedCurrent;
         showValveCurrent(confirmedCurrent);
         setPressureControlUi(true);
         pressureControlElapsed.start();
@@ -1826,14 +1837,15 @@ int main(int argc, char *argv[]) {
             std::min(2.0, static_cast<double>(pressureControlElapsed.restart()) / 1000.0));
         const bool openingRaisesPressure =
             ui.cmbPressureControlDirection->currentData().toBool();
-        const double previousOpening = pressureValveController.openingPercent();
         const double opening = pressureValveController.update(targetPressurePa(),
                                                                 latestPressurePa[channel],
                                                                 pressureFullScalePa[channel],
                                                                 elapsedSeconds,
                                                                 openingRaisesPressure);
-        double confirmedCurrent = N4IOA01Valve::openingToCurrent(opening);
-        if (std::abs(opening - previousOpening) >= 0.05) {
+        // Compare with the last successful write so small PI adjustments
+        // accumulate until they can be sent to the valve.
+        if (std::abs(opening - pressureControlAppliedOpening) >= 0.05) {
+            double confirmedCurrent = 0.0;
             QString error;
             if (!proportional_valve.setOpeningPercent(opening, &confirmedCurrent, &error)) {
                 stopPressureControl(QString("比例阀通信失败：%1。闭环已停止。").arg(error),
@@ -1841,6 +1853,8 @@ int main(int argc, char *argv[]) {
                                     true);
                 return;
             }
+            pressureControlAppliedOpening = opening;
+            pressureControlAppliedCurrent = confirmedCurrent;
             showValveCurrent(confirmedCurrent);
         }
 
@@ -1851,8 +1865,8 @@ int main(int argc, char *argv[]) {
                 .arg(targetPressurePa(), 0, 'f', 1)
                 .arg(latestPressurePa[channel], 0, 'f', 1)
                 .arg(errorPa, 0, 'f', 1)
-                .arg(opening, 0, 'f', 1)
-                .arg(confirmedCurrent, 0, 'f', 2));
+                .arg(pressureControlAppliedOpening, 0, 'f', 1)
+                .arg(pressureControlAppliedCurrent, 0, 'f', 2));
     });
 
     QObject::connect(ui.btnPressureControlStop, &QPushButton::clicked, [&]() {

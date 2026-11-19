@@ -82,6 +82,7 @@ private:
     bool readExactly(std::uint8_t *data, std::size_t expected, const QString& operation,
                      Deadline deadline, QString *error);
     bool sendCommand(std::initializer_list<std::uint8_t> command,
+                     std::size_t expectedRxBytes,
                      const QString& operation, QString *error);
     bool initializeDevice(QString *error);
     bool closeDevice(QString *error);

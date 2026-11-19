@@ -167,10 +167,11 @@ bool DaqWorker::readExactly(std::uint8_t *data,
 }
 
 bool DaqWorker::sendCommand(std::initializer_list<std::uint8_t> command,
+                            std::size_t expectedRxBytes,
                             const QString& operation,
                             QString *error) {
     std::vector<std::uint8_t> tx(command);
-    std::vector<std::uint8_t> rx(RX_BYTES, 0);
+    std::vector<std::uint8_t> rx(expectedRxBytes, 0);
     if (!checkFtStatus(api_->purge(ftHandle_, FT_PURGE_RX | FT_PURGE_TX),
                        operation + QStringLiteral(" FT_Purge"), error)) return false;
     if (!writeAll(tx.data(), tx.size(), operation + QStringLiteral(" FT_Write"),
@@ -208,18 +209,20 @@ bool DaqWorker::initializeDevice(QString *error) {
     if (!writeAll(initCommands, sizeof(initCommands), QStringLiteral("MPSSE initialization"),
                   std::chrono::steady_clock::now() + transactionTimeout_, error)) return false;
 
+    // MPSSE encodes transfer length as byte count minus one. The range write
+    // clocks three bytes; reset, channel selection and conversion clock four.
     return sendCommand({0x80, VAL_CS_LOW, DIR_MASK, XFER_OPCODE, 0x03, 0x00, 0x85,
                         0x00, 0x00, 0x00, 0x80, VAL_IDLE, DIR_MASK, 0x87},
-                       QStringLiteral("ADS8688 reset"), error) &&
+                       4, QStringLiteral("ADS8688 reset"), error) &&
            sendCommand({0x80, VAL_CS_LOW, DIR_MASK, XFER_OPCODE, 0x02, 0x00, 0x0D,
                         0x05, 0x00, 0x80, VAL_IDLE, DIR_MASK, 0x87},
-                       QStringLiteral("ADS8688 CH1 range configuration"), error) &&
+                       3, QStringLiteral("ADS8688 CH1 range configuration"), error) &&
            sendCommand({0x80, VAL_CS_LOW, DIR_MASK, XFER_OPCODE, 0x03, 0x00, 0xC4,
                         0x00, 0x00, 0x00, 0x80, VAL_IDLE, DIR_MASK, 0x87},
-                       QStringLiteral("ADS8688 CH1 selection"), error) &&
+                       4, QStringLiteral("ADS8688 CH1 selection"), error) &&
            sendCommand({0x80, VAL_CS_LOW, DIR_MASK, XFER_OPCODE, 0x03, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x80, VAL_IDLE, DIR_MASK, 0x87},
-                       QStringLiteral("ADS8688 dummy conversion"), error);
+                       4, QStringLiteral("ADS8688 dummy conversion"), error);
 }
 
 bool DaqWorker::closeDevice(QString *error) {

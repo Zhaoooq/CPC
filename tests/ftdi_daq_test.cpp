@@ -3,10 +3,11 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <vector>
 
 class FakeD2xxApi : public D2xxApi {
 public:
-    enum class Failure { None, QueueStatus, Read, Disconnect, ZeroWrite };
+    enum class Failure { None, QueueStatus, Read, Disconnect, ZeroWrite, ShortRangeResponse };
 
     explicit FakeD2xxApi(Failure failure) : failure_(failure) {}
 
@@ -19,14 +20,20 @@ public:
     FT_STATUS setTimeouts(FT_HANDLE, DWORD, DWORD) override { return FT_OK; }
     FT_STATUS setLatencyTimer(FT_HANDLE, UCHAR) override { return FT_OK; }
     FT_STATUS setBitMode(FT_HANDLE, UCHAR, UCHAR) override { return FT_OK; }
-    FT_STATUS purge(FT_HANDLE, ULONG) override { return FT_OK; }
+    FT_STATUS purge(FT_HANDLE, ULONG) override {
+        queuedBytes_ = 0;
+        return FT_OK;
+    }
 
-    FT_STATUS write(FT_HANDLE, void *, DWORD requested, DWORD *written) override {
+    FT_STATUS write(FT_HANDLE, void *buffer, DWORD requested, DWORD *written) override {
         ++writeCalls;
         if (failure_ == Failure::ZeroWrite) {
             *written = 0;
         } else {
             *written = requested > 1 ? requested / 2 : requested;
+            const auto *bytes = static_cast<const std::uint8_t *>(buffer);
+            pendingCommands_.insert(pendingCommands_.end(), bytes, bytes + *written);
+            processCommands();
         }
         return FT_OK;
     }
@@ -35,11 +42,7 @@ public:
         if (initializationTransactions_ >= 4 && failure_ == Failure::QueueStatus) {
             return FT_IO_ERROR;
         }
-        if (initializationTransactions_ >= 4 && failure_ == Failure::ZeroWrite) {
-            *queued = 0;
-        } else {
-            *queued = 65536;
-        }
+        *queued = queuedBytes_;
         return FT_OK;
     }
 
@@ -49,12 +52,15 @@ public:
             if (failure_ == Failure::Disconnect) return FT_DEVICE_NOT_FOUND;
         }
         const DWORD amount = requested > 1 ? requested / 2 : requested;
+        assert(amount <= queuedBytes_);
         std::memset(buffer, 0, amount);
         *received = amount;
         ++readCalls;
+        queuedBytes_ -= amount;
         if (initializationTransactions_ < 4) {
             initializationBytes_ += amount;
-            if (initializationBytes_ >= RX_BYTES) {
+            if (queuedBytes_ == 0) {
+                initializationReplyBytes.push_back(initializationBytes_);
                 initializationBytes_ = 0;
                 ++initializationTransactions_;
             }
@@ -70,11 +76,43 @@ public:
     int writeCalls = 0;
     int readCalls = 0;
     bool closed = false;
+    std::vector<DWORD> initializationReplyBytes;
 
 private:
+    // Model actual MPSSE byte counts, including commands split across USB writes.
+    void processCommands() {
+        std::size_t consumed = 0;
+        while (consumed < pendingCommands_.size()) {
+            const auto *command = pendingCommands_.data() + consumed;
+            const std::size_t remaining = pendingCommands_.size() - consumed;
+            std::size_t size = 1;
+            DWORD replyBytes = 0;
+            if (command[0] == XFER_OPCODE) {
+                if (remaining < 3) break;
+                replyBytes = 1U + command[1] + (static_cast<DWORD>(command[2]) << 8U);
+                size = 3U + replyBytes;
+            } else if (command[0] == 0x80 || command[0] == 0x86) {
+                size = 3;
+            } else {
+                assert(command[0] == 0x8A || command[0] == 0x97 ||
+                       command[0] == 0x8D || command[0] == 0x85 || command[0] == 0x87);
+            }
+            if (remaining < size) break;
+            if (replyBytes && initializationTransactions_ == 1 &&
+                failure_ == Failure::ShortRangeResponse) {
+                --replyBytes;
+            }
+            queuedBytes_ += replyBytes;
+            consumed += size;
+        }
+        pendingCommands_.erase(pendingCommands_.begin(), pendingCommands_.begin() + consumed);
+    }
+
     Failure failure_;
     int initializationTransactions_ = 0;
     DWORD initializationBytes_ = 0;
+    DWORD queuedBytes_ = 0;
+    std::vector<std::uint8_t> pendingCommands_;
 };
 
 void expectFiniteFailure(FakeD2xxApi::Failure failure, const QString& expectedText) {
@@ -120,11 +158,14 @@ int main() {
         assert(api.writeCalls > 10);
         assert(api.readCalls > 10);
         assert(api.closed);
+        assert((api.initializationReplyBytes == std::vector<DWORD>{4, 3, 4, 4}));
     }
 
     expectFiniteFailure(FakeD2xxApi::Failure::QueueStatus, "FT_GetQueueStatus");
     expectFiniteFailure(FakeD2xxApi::Failure::Read, "FT_Read");
     expectFiniteFailure(FakeD2xxApi::Failure::Disconnect, "FT_STATUS");
     expectFiniteFailure(FakeD2xxApi::Failure::ZeroWrite, "timeout");
+    expectFiniteFailure(FakeD2xxApi::Failure::ShortRangeResponse,
+                        "ADS8688 CH1 range configuration FT_Read timeout: expected 3 bytes, received 2 bytes");
     return 0;
 }
